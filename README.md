@@ -180,17 +180,18 @@ Run the package-local benchmark:
 npm run bench
 ```
 
-Latest local package benchmark on Node v26.1.0, darwin arm64, 9 rounds:
+Latest local package benchmark on Node v26.1.0, darwin arm64, 15 rounds:
 
 | Fixture | Median | p95 |
 | --- | ---: | ---: |
-| Append keyed JSON event | 5.61 us | 10.17 us |
-| Read replay window, 32 records | 260.19 us | 319.01 us |
-| Consumer read and ack | 57.61 us | 83.99 us |
-| Compact keyed log, 1k records | 162.08 us | 168.42 us |
-| Append Frontier patch event | 2.32 us | 3.08 us |
+| Append keyed JSON event | 3.77 us | 5.09 us |
+| Read replay window, 32 records | 1.46 us | 1.84 us |
+| Consumer read and ack | 0.39 us | 0.50 us |
+| Compact keyed log, 1k records | 159.40 us | 192.08 us |
+| Append Frontier patch event | 2.23 us | 2.83 us |
 
 These are Frontier-only package measurements, not competitor comparisons.
+Replay and consumer fixtures use preseeded retained logs so the timed work is read/cursor behavior, not fixture construction.
 
 ## License
 

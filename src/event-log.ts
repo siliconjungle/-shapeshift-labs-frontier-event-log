@@ -216,10 +216,10 @@ export function createEventLog<T extends JsonValue = JsonValue>(options: EventLo
     const out: EventLogRecord<T>[] = [];
     let bytes = 0;
     let cursorOffset = start;
+    const startIndex = findRecordIndex(start);
 
-    for (let i = 0; i < records.length && out.length < limit; i++) {
+    for (let i = startIndex; i < records.length && out.length < limit; i++) {
       const record = records[i];
-      if (record.offset < start) continue;
       const size = maxBytes === Number.POSITIVE_INFINITY ? 0 : estimateJsonBytes(record as unknown as JsonValue);
       if (bytes + size > maxBytes) break;
       out[out.length] = cloneRecord(record);
@@ -307,6 +307,17 @@ export function createEventLog<T extends JsonValue = JsonValue>(options: EventLo
 
   function readLag(offset: number): number {
     return Math.max(0, nextOffset - Math.max(0, Math.floor(offset)));
+  }
+
+  function findRecordIndex(offset: number): number {
+    let low = 0;
+    let high = records.length;
+    while (low < high) {
+      const mid = (low + high) >>> 1;
+      if (records[mid].offset < offset) low = mid + 1;
+      else high = mid;
+    }
+    return low;
   }
 
   return {
