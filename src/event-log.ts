@@ -216,10 +216,10 @@ export function createEventLog<T extends JsonValue = JsonValue>(options: EventLo
     const out: EventLogRecord<T>[] = [];
     let bytes = 0;
     let cursorOffset = start;
+    const startIndex = findRecordIndex(start);
 
-    for (let i = 0; i < records.length && out.length < limit; i++) {
+    for (let i = startIndex; i < records.length && out.length < limit; i++) {
       const record = records[i];
-      if (record.offset < start) continue;
       const size = maxBytes === Number.POSITIVE_INFINITY ? 0 : estimateJsonBytes(record as unknown as JsonValue);
       if (bytes + size > maxBytes) break;
       out[out.length] = cloneRecord(record);
@@ -249,20 +249,25 @@ export function createEventLog<T extends JsonValue = JsonValue>(options: EventLo
 
   function compact(compactOptions: EventLogCompactOptions = {}): number {
     const dropNulls = compactOptions.dropTombstones === undefined ? dropTombstones : compactOptions.dropTombstones === true;
-    const latest = new Map<string, number>();
-    for (let i = 0; i < records.length; i++) {
-      const key = records[i].key;
-      if (key !== undefined) latest.set(key, i);
+    const keep = new Uint8Array(records.length);
+    const seen = new Set<string>();
+    let keyed = false;
+    for (let i = records.length - 1; i >= 0; i--) {
+      const record = records[i];
+      const key = record.key;
+      if (key === undefined) {
+        keep[i] = 1;
+        continue;
+      }
+      keyed = true;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (!(dropNulls && record.value === null)) keep[i] = 1;
     }
-    if (latest.size === 0) return 0;
-
+    if (!keyed) return 0;
     let write = 0;
     for (let readIndex = 0; readIndex < records.length; readIndex++) {
-      const record = records[readIndex];
-      const key = record.key;
-      const keep = key === undefined ||
-        latest.get(key) === readIndex && !(dropNulls && record.value === null);
-      if (keep) records[write++] = record;
+      if (keep[readIndex] !== 0) records[write++] = records[readIndex];
     }
     const removed = records.length - write;
     if (removed !== 0) {
@@ -307,6 +312,17 @@ export function createEventLog<T extends JsonValue = JsonValue>(options: EventLo
 
   function readLag(offset: number): number {
     return Math.max(0, nextOffset - Math.max(0, Math.floor(offset)));
+  }
+
+  function findRecordIndex(offset: number): number {
+    let low = 0;
+    let high = records.length;
+    while (low < high) {
+      const mid = (low + high) >>> 1;
+      if (records[mid].offset < offset) low = mid + 1;
+      else high = mid;
+    }
+    return low;
   }
 
   return {

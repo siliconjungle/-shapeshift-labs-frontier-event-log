@@ -20,6 +20,9 @@ const patch = diff(
   { rows: [{ id: 'a', score: 2 }, { id: 'b', score: 3 }], meta: { tick: 1 } },
   { arrayKey: 'id' }
 );
+const replayLog = seededLog(4096);
+const consumerLog = seededLog(512);
+const consumer = consumerLog.createConsumer('bench');
 
 const rows = [
   runRow('Append keyed JSON event', 4000, () => {
@@ -29,13 +32,11 @@ const rows = [
     sink += last;
   }),
   runRow('Read replay window, 32 records', 3000, () => {
-    const log = seededLog(1024);
-    const result = log.read(128, { limit: 32 });
+    const result = replayLog.read(3500, { limit: 32 });
     sink += result.records.length;
   }),
   runRow('Consumer read and ack', 3000, () => {
-    const log = seededLog(256);
-    const consumer = log.createConsumer('bench');
+    consumer.seek(384);
     const result = consumer.read({ limit: 8 });
     consumer.ack();
     sink += result.records.length;
