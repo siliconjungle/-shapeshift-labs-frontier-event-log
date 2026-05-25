@@ -249,20 +249,25 @@ export function createEventLog<T extends JsonValue = JsonValue>(options: EventLo
 
   function compact(compactOptions: EventLogCompactOptions = {}): number {
     const dropNulls = compactOptions.dropTombstones === undefined ? dropTombstones : compactOptions.dropTombstones === true;
-    const latest = new Map<string, number>();
-    for (let i = 0; i < records.length; i++) {
-      const key = records[i].key;
-      if (key !== undefined) latest.set(key, i);
+    const keep = new Uint8Array(records.length);
+    const seen = new Set<string>();
+    let keyed = false;
+    for (let i = records.length - 1; i >= 0; i--) {
+      const record = records[i];
+      const key = record.key;
+      if (key === undefined) {
+        keep[i] = 1;
+        continue;
+      }
+      keyed = true;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (!(dropNulls && record.value === null)) keep[i] = 1;
     }
-    if (latest.size === 0) return 0;
-
+    if (!keyed) return 0;
     let write = 0;
     for (let readIndex = 0; readIndex < records.length; readIndex++) {
-      const record = records[readIndex];
-      const key = record.key;
-      const keep = key === undefined ||
-        latest.get(key) === readIndex && !(dropNulls && record.value === null);
-      if (keep) records[write++] = record;
+      if (keep[readIndex] !== 0) records[write++] = records[readIndex];
     }
     const removed = records.length - write;
     if (removed !== 0) {
