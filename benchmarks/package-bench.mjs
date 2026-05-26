@@ -4,8 +4,14 @@ import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
 import { diff } from '@shapeshift-labs/frontier';
 import {
+  applyPatchEventRecord,
   appendPatchEvent,
-  createEventLog
+  createEventLog,
+  createEventLogCheckpoint,
+  createEventLogReplayStorage,
+  diffBetweenTimes,
+  stateAtTime,
+  replayEventLog
 } from '../dist/index.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -23,6 +29,11 @@ const patch = diff(
 const replayLog = seededLog(4096);
 const consumerLog = seededLog(512);
 const consumer = consumerLog.createConsumer('bench');
+const temporalPatchFixture = seededPatchLog(128);
+const compactBatchInputs = Array.from({ length: 1024 }, (_, i) => ({
+  key: 'entity:' + (i & 127),
+  value: { revision: i }
+}));
 
 const rows = [
   runRow('Append keyed JSON event', 4000, () => {
@@ -46,6 +57,41 @@ const rows = [
     for (let i = 0; i < 1024; i++) log.append({ key: 'entity:' + (i & 127), value: { revision: i } });
     sink += log.compact();
   }),
+  runRow('Append batch compactOnAppend, 1k records', 80, () => {
+    const log = createEventLog({ compactByKey: true, compactOnAppend: true, dropTombstones: true, now: () => 1 });
+    sink += log.appendBatch(compactBatchInputs).records.length;
+  }),
+  runRow('Replay from checkpoint, 64 records', 1000, () => {
+    const log = createEventLog({ now: () => 1 });
+    for (let i = 0; i < 128; i++) log.append({ value: { delta: 1 } });
+    const checkpoint = createEventLogCheckpoint(log, { total: 128 }, { timestamp: 1 });
+    for (let i = 0; i < 64; i++) log.append({ value: { delta: 1 } });
+    sink += replayEventLog(log, checkpoint, (state, record) => ({ total: state.total + record.value.delta })).state.total;
+  }),
+  runRow('State at offset, 64 patch events', 1000, () => {
+    const result = stateAtTime(
+      temporalPatchFixture.log,
+      temporalPatchFixture.checkpoint,
+      applyPatchEventRecord,
+      { at: 64, batchSize: 32 }
+    );
+    sink += result.state.rows[0].score;
+  }),
+  runRow('Diff between offsets, 64 patch events', 500, () => {
+    const result = diffBetweenTimes(
+      temporalPatchFixture.log,
+      temporalPatchFixture.checkpoint,
+      applyPatchEventRecord,
+      { from: 32, to: 96, batchSize: 32 }
+    );
+    sink += result.patch.length + result.after.rows[0].score;
+  }),
+  runRow('Replay storage append/read checkpoint', 1000, () => {
+    const storage = createEventLogReplayStorage({ initialSnapshot: { count: 0 }, now: () => 1 });
+    for (let i = 0; i < 32; i++) storage.appendChange({ seq: i + 1, type: 'change', value: i });
+    sink += storage.readChangeLog({ sinceSeq: 16 }).length;
+    sink += storage.compact({ count: 32 }).cursor.offset;
+  }),
   runRow('Append Frontier patch event', 4000, () => {
     const log = createEventLog({ capacity: 128, now: () => 1 });
     sink += appendPatchEvent(log, patch, { key: 'doc:1', metadata: { tick: 1 } }).offset;
@@ -58,6 +104,18 @@ function seededLog(count) {
   const log = createEventLog({ capacity: count + 1, now: () => 1 });
   for (let i = 0; i < count; i++) log.append({ key: 'k' + (i & 255), value: { i, value: i & 7 } });
   return log;
+}
+
+function seededPatchLog(count) {
+  const log = createEventLog({ capacity: count + 1, now: () => 1 });
+  let state = { rows: [{ id: 'a', score: 0 }], meta: { tick: 0 } };
+  const checkpoint = createEventLogCheckpoint(log, state, { timestamp: 0 });
+  for (let i = 0; i < count; i++) {
+    const next = { rows: [{ id: 'a', score: i + 1 }], meta: { tick: i + 1 } };
+    appendPatchEvent(log, diff(state, next, { arrayKey: 'id' }), { key: 'doc:1', timestamp: i + 1 });
+    state = next;
+  }
+  return { log, checkpoint };
 }
 
 function measure(fn, inner) {

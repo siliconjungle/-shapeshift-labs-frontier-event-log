@@ -1,5 +1,10 @@
 import assert from 'node:assert';
-import { createEventLog } from '../dist/index.js';
+import {
+  createEventLog,
+  createEventLogCheckpoint,
+  replayEventLog,
+  stateAtTime
+} from '../dist/index.js';
 
 const args = parseArgs(process.argv.slice(2));
 const cases = readPositiveInt(args.cases, 500);
@@ -26,7 +31,7 @@ function runCase(caseId, rng) {
   let lastHighWatermark = -1;
 
   for (let step = 0; step < 80; step++) {
-    const choice = randomInt(rng, 8);
+    const choice = randomInt(rng, 9);
     if (choice < 4) {
       const result = log.tryAppend({
         key: randomInt(rng, 3) === 0 ? 'k' + randomInt(rng, 8) : undefined,
@@ -50,6 +55,8 @@ function runCase(caseId, rng) {
     } else if (choice === 6) {
       consumer.read({ limit: randomInt(rng, 5) });
       consumer.ack();
+    } else if (choice === 7) {
+      log.truncateBefore(randomInt(rng, log.nextOffset + 1));
     } else {
       consumer.seek(randomInt(rng, log.nextOffset + 1));
     }
@@ -66,6 +73,25 @@ function runCase(caseId, rng) {
       previous = record.offset;
     }
     assert.ok(replay.cursor.offset <= log.nextOffset);
+    const split = randomInt(rng, replay.records.length + 1);
+    const checkpointCursor = split === 0
+      ? replay.firstOffset
+      : replay.records[split - 1].offset + 1;
+    const checkpoint = createEventLogCheckpoint(log, { count: split }, { cursor: checkpointCursor });
+    const replayed = replayEventLog(log, checkpoint, (state) => ({ count: state.count + 1 }), { strict: false });
+    assert.strictEqual(replayed.state.count, replay.records.length);
+    assert.strictEqual(replayed.replayed, replay.records.length - split);
+
+    const targetIndex = split + randomInt(rng, replay.records.length - split + 1);
+    const targetCursor = targetIndex === 0
+      ? replay.firstOffset
+      : replay.records[targetIndex - 1].offset + 1;
+    const temporal = stateAtTime(log, checkpoint, (state) => ({ count: state.count + 1 }), {
+      at: targetCursor,
+      strict: false
+    });
+    assert.strictEqual(temporal.state.count, targetIndex);
+    assert.strictEqual(temporal.replayed, targetIndex - split);
   }
 }
 

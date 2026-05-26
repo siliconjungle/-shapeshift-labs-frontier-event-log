@@ -1,6 +1,6 @@
 {
   "name": "@shapeshift-labs/frontier-event-log",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "Bounded in-memory event logs, replay cursors, compaction, and Frontier patch events.",
   "type": "module",
   "license": "MIT",
@@ -48,7 +48,7 @@
     "node": ">=18"
   },
   "dependencies": {
-    "@shapeshift-labs/frontier": "0.1.5"
+    "@shapeshift-labs/frontier": "0.1.8"
   },
   "scripts": {
     "build": "node build.mjs",
