@@ -5,7 +5,10 @@ import { fileURLToPath } from 'node:url';
 import { diff } from '@shapeshift-labs/frontier';
 import {
   appendPatchEvent,
-  createEventLog
+  createEventLog,
+  createEventLogCheckpoint,
+  createEventLogReplayStorage,
+  replayEventLog
 } from '../dist/index.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -23,6 +26,10 @@ const patch = diff(
 const replayLog = seededLog(4096);
 const consumerLog = seededLog(512);
 const consumer = consumerLog.createConsumer('bench');
+const compactBatchInputs = Array.from({ length: 1024 }, (_, i) => ({
+  key: 'entity:' + (i & 127),
+  value: { revision: i }
+}));
 
 const rows = [
   runRow('Append keyed JSON event', 4000, () => {
@@ -45,6 +52,23 @@ const rows = [
     const log = createEventLog({ compactByKey: true, dropTombstones: true, now: () => 1 });
     for (let i = 0; i < 1024; i++) log.append({ key: 'entity:' + (i & 127), value: { revision: i } });
     sink += log.compact();
+  }),
+  runRow('Append batch compactOnAppend, 1k records', 80, () => {
+    const log = createEventLog({ compactByKey: true, compactOnAppend: true, dropTombstones: true, now: () => 1 });
+    sink += log.appendBatch(compactBatchInputs).records.length;
+  }),
+  runRow('Replay from checkpoint, 64 records', 1000, () => {
+    const log = createEventLog({ now: () => 1 });
+    for (let i = 0; i < 128; i++) log.append({ value: { delta: 1 } });
+    const checkpoint = createEventLogCheckpoint(log, { total: 128 }, { timestamp: 1 });
+    for (let i = 0; i < 64; i++) log.append({ value: { delta: 1 } });
+    sink += replayEventLog(log, checkpoint, (state, record) => ({ total: state.total + record.value.delta })).state.total;
+  }),
+  runRow('Replay storage append/read checkpoint', 1000, () => {
+    const storage = createEventLogReplayStorage({ initialSnapshot: { count: 0 }, now: () => 1 });
+    for (let i = 0; i < 32; i++) storage.appendChange({ seq: i + 1, type: 'change', value: i });
+    sink += storage.readChangeLog({ sinceSeq: 16 }).length;
+    sink += storage.compact({ count: 32 }).cursor.offset;
   }),
   runRow('Append Frontier patch event', 4000, () => {
     const log = createEventLog({ capacity: 128, now: () => 1 });

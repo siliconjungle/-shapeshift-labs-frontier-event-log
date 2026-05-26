@@ -10,6 +10,9 @@ This package sits beside [`@shapeshift-labs/frontier`](https://www.npmjs.com/pac
 
 ## Related Packages
 
+- [`@shapeshift-labs/frontier-state-cache-idb`](https://www.npmjs.com/package/@shapeshift-labs/frontier-state-cache-idb): IndexedDB persistence adapter for Frontier state-cache snapshots.
+- [`@shapeshift-labs/frontier-state-cache-file`](https://www.npmjs.com/package/@shapeshift-labs/frontier-state-cache-file): Structured file persistence adapter for Frontier state-cache snapshots and change logs.
+- [`@shapeshift-labs/frontier-state-cache-sql`](https://www.npmjs.com/package/@shapeshift-labs/frontier-state-cache-sql): SQL persistence adapter for Frontier state-cache snapshots and change logs.
 - [`@shapeshift-labs/frontier`](https://www.npmjs.com/package/@shapeshift-labs/frontier): core JSON diff/apply primitives used by patch events.
 - [`@shapeshift-labs/frontier-query`](https://www.npmjs.com/package/@shapeshift-labs/frontier-query): shared query-key, selector path, condition, identity, and table-schema primitives.
 - [`@shapeshift-labs/frontier-codec`](https://www.npmjs.com/package/@shapeshift-labs/frontier-codec): patch serialization, binary frames, canonical JSON, and patch-history codecs.
@@ -22,6 +25,9 @@ This package sits beside [`@shapeshift-labs/frontier`](https://www.npmjs.com/pac
 
 Package source repositories:
 
+- [`siliconjungle/-shapeshift-labs-frontier-state-cache-idb`](https://github.com/siliconjungle/-shapeshift-labs-frontier-state-cache-idb)
+- [`siliconjungle/-shapeshift-labs-frontier-state-cache-file`](https://github.com/siliconjungle/-shapeshift-labs-frontier-state-cache-file)
+- [`siliconjungle/-shapeshift-labs-frontier-state-cache-sql`](https://github.com/siliconjungle/-shapeshift-labs-frontier-state-cache-sql)
 - [`siliconjungle/-shapeshift-labs-frontier`](https://github.com/siliconjungle/-shapeshift-labs-frontier)
 - [`siliconjungle/-shapeshift-labs-frontier-query`](https://github.com/siliconjungle/-shapeshift-labs-frontier-query)
 - [`siliconjungle/-shapeshift-labs-frontier-codec`](https://github.com/siliconjungle/-shapeshift-labs-frontier-codec)
@@ -75,11 +81,16 @@ console.log(replay.records, replay.cursor);
 ```ts
 import {
   appendPatchEvent,
+  createEventLogCheckpoint,
   createEventLog,
+  createEventLogReplayStorage,
+  replayEventLog,
   type EventLog,
+  type EventLogCheckpoint,
   type EventLogConsumer,
   type EventLogCursor,
   type EventLogRecord,
+  type EventLogReplayStorage,
   type PatchEventLogValue
 } from '@shapeshift-labs/frontier-event-log';
 ```
@@ -104,6 +115,7 @@ Useful options:
 - `log.tryAppend(input)` returns `{ accepted, record?, reason? }`.
 - `log.appendBatch(inputs, { maxRecords?, maxBytes? })` appends a bounded batch.
 - `log.read(cursor?, { limit?, maxBytes? })` returns cloned records plus a cursor.
+- `log.truncateBefore(cursor)` drops retained records before a checkpoint cursor.
 - `log.clear()` removes retained records without resetting the next offset.
 
 ### Consumers
@@ -115,6 +127,17 @@ consumer.ack(result.cursor);
 ```
 
 Consumers own a read cursor and a committed cursor. They are useful for replay windows, durable checkpoints, and independent application workers.
+
+### Checkpoints And Replay
+
+```ts
+const checkpoint = createEventLogCheckpoint(log, { count: 2 });
+const result = replayEventLog(log, checkpoint, (state, record) => ({
+  count: state.count + Number(record.value.delta || 0)
+}));
+```
+
+`createEventLogCheckpoint()` captures an application snapshot plus an event-log cursor. `replayEventLog()` resumes from that cursor in bounded batches and returns the replayed state, cursor, replay count, and a fresh checkpoint. `createEventLogReplayStorage()` provides the same snapshot-plus-bounded-change-log shape used by state-cache persistence without making state-cache depend on event-log.
 
 ### Patch Events
 
@@ -141,6 +164,8 @@ Both imports expose the same event-log API.
 This package owns:
 
 - in-memory event logs,
+- snapshot checkpoints and bounded replay helpers,
+- generic replay storage for snapshot plus change-log adapters,
 - append batching and bounded replay windows,
 - consumer cursors and acknowledgements,
 - capacity retention policies,
@@ -169,7 +194,7 @@ npm run bench
 npm run pack:dry
 ```
 
-The package test suite covers root and subpath imports, append/read behavior, clone isolation, retention policies, keyed compaction, batch limits, consumers, patch events, and randomized operation sequences.
+The package test suite covers root and subpath imports, append/read behavior, clone isolation, retention policies, keyed compaction, batch limits, consumers, checkpoint replay, replay storage, patch events, and randomized operation sequences.
 
 ## Benchmarks
 
@@ -179,15 +204,18 @@ Run the package-local benchmark:
 npm run bench
 ```
 
-Latest local package benchmark on Node v26.1.0, darwin arm64, 9 rounds:
+Latest local package benchmark on Node v26.1.0, darwin arm64, 15 rounds:
 
 | Fixture | Median | p95 |
 | --- | ---: | ---: |
-| Append keyed JSON event | 4.44 us | 19.48 us |
-| Read replay window, 32 records | 1.64 us | 2.07 us |
-| Consumer read and ack | 0.49 us | 0.67 us |
-| Compact keyed log, 1k records | 199.66 us | 238.51 us |
-| Append Frontier patch event | 3.63 us | 5.52 us |
+| Append keyed JSON event | 3.63 us | 4.83 us |
+| Read replay window, 32 records | 1.65 us | 2.10 us |
+| Consumer read and ack | 0.43 us | 0.54 us |
+| Compact keyed log, 1k records | 147.93 us | 173.88 us |
+| Append batch compactOnAppend, 1k records | 98.44 us | 105.96 us |
+| Replay from checkpoint, 64 records | 26.61 us | 30.18 us |
+| Replay storage append/read checkpoint | 10.35 us | 11.78 us |
+| Append Frontier patch event | 2.27 us | 2.86 us |
 
 These are Frontier-only package measurements, not competitor comparisons.
 Replay and consumer fixtures use preseeded retained logs so the timed work is read/cursor behavior, not fixture construction.

@@ -2,7 +2,10 @@ import assert from 'node:assert';
 import { diff } from '@shapeshift-labs/frontier';
 import {
   appendPatchEvent,
-  createEventLog
+  createEventLog,
+  createEventLogCheckpoint,
+  createEventLogReplayStorage,
+  replayEventLog
 } from '../dist/index.js';
 import { createEventLog as createEventLogSubpath } from '../dist/event-log.js';
 
@@ -78,6 +81,18 @@ assert.strictEqual(createEventLogSubpath, createEventLog);
 }
 
 {
+  const log = createEventLog({ compactByKey: true, compactOnAppend: true, dropTombstones: true, now: () => 1 });
+  log.appendBatch(Array.from({ length: 32 }, (_, i) => ({
+    key: 'entity:' + (i & 7),
+    value: { revision: i }
+  })));
+  const records = log.read(0).records;
+  assert.strictEqual(records.length, 8);
+  assert.deepStrictEqual(records.map((record) => record.value.revision), [24, 25, 26, 27, 28, 29, 30, 31]);
+  assert.strictEqual(log.getStats().compacted, 24);
+}
+
+{
   const log = createEventLog();
   for (let i = 0; i < 5; i++) log.append({ value: { i } });
   const consumer = log.createConsumer('agent');
@@ -89,6 +104,45 @@ assert.strictEqual(createEventLogSubpath, createEventLog);
   consumer.seek(4);
   assert.deepStrictEqual(consumer.read({ limit: 10 }).records.map((record) => record.value.i), [4]);
   assert.strictEqual(consumer.lag(), 0);
+}
+
+{
+  const log = createEventLog({ now: () => 10 });
+  log.append({ value: { delta: 1 } });
+  log.append({ value: { delta: 2 } });
+  const checkpoint = createEventLogCheckpoint(log, { total: 3 }, { timestamp: 11, metadata: { label: 'after-two' } });
+  log.append({ value: { delta: 4 } });
+  log.append({ value: { delta: 5 } });
+  const replayed = replayEventLog(log, checkpoint, (state, record) => ({
+    total: state.total + record.value.delta
+  }));
+  assert.deepStrictEqual(replayed.state, { total: 12 });
+  assert.strictEqual(replayed.replayed, 2);
+  assert.deepStrictEqual(replayed.cursor, { offset: 4 });
+  assert.strictEqual(log.truncateBefore(checkpoint.cursor), 2);
+  assert.strictEqual(log.read(0).truncated, true);
+  assert.deepStrictEqual(log.read(0).records.map((record) => record.value.delta), [4, 5]);
+}
+
+{
+  const storage = createEventLogReplayStorage({
+    initialSnapshot: { todos: 1 },
+    now: () => 20
+  });
+  storage.appendChange({ seq: 1, type: 'query' });
+  storage.appendChange({ seq: 2, type: 'entity' });
+  storage.appendChange({ seq: 3, type: 'query' });
+  assert.deepStrictEqual(storage.load(), { todos: 1 });
+  assert.deepStrictEqual(storage.readChangeLog({ limit: 0 }), []);
+  assert.deepStrictEqual(storage.readChangeLog({ sinceSeq: 1, limit: 1 }).map((entry) => entry.seq), [2]);
+  const checkpoint = storage.compact({ todos: 2 });
+  assert.deepStrictEqual(checkpoint.snapshot, { todos: 2 });
+  assert.strictEqual(storage.getStats().log.records, 0);
+  const restored = createEventLogReplayStorage({ initialCheckpoint: checkpoint });
+  assert.deepStrictEqual(restored.load(), { todos: 2 });
+  storage.appendChange({ seq: 4, type: 'query' });
+  assert.deepStrictEqual(storage.readChangeLog().map((entry) => entry.seq), [4]);
+  assert.deepStrictEqual(storage.getCheckpoint().cursor, checkpoint.cursor);
 }
 
 {

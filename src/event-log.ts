@@ -70,6 +70,14 @@ export interface EventLogReadResult<T extends JsonValue = JsonValue> {
   lag: number;
 }
 
+export interface EventLogCheckpoint<TSnapshot = JsonValue> {
+  cursor: EventLogCursor;
+  snapshot: TSnapshot;
+  timestamp: number;
+  highWatermark: number;
+  metadata?: JsonObject;
+}
+
 export interface EventLogStats {
   records: number;
   firstOffset: number;
@@ -101,12 +109,72 @@ export interface EventLog<T extends JsonValue = JsonValue> {
   read(cursor?: EventLogCursor | number | null, options?: EventLogReadOptions): EventLogReadResult<T>;
   createConsumer(id: string, cursor?: EventLogCursor | number | null): EventLogConsumer<T>;
   compact(options?: EventLogCompactOptions): number;
+  truncateBefore(cursor: EventLogCursor | number): number;
   clear(): void;
   getStats(): EventLogStats;
 }
 
 export interface EventLogCompactOptions {
   dropTombstones?: boolean;
+}
+
+export interface EventLogCheckpointOptions {
+  cursor?: EventLogCursor | number;
+  timestamp?: number;
+  metadata?: JsonObject;
+}
+
+export type EventLogReplayReducer<TState, TValue extends JsonValue = JsonValue> = (
+  state: TState,
+  record: EventLogRecord<TValue>
+) => TState;
+
+export interface EventLogReplayOptions {
+  batchSize?: number;
+  maxBytesPerRead?: number;
+  strict?: boolean;
+}
+
+export interface EventLogReplayResult<TState> {
+  state: TState;
+  cursor: EventLogCursor;
+  checkpoint: EventLogCheckpoint<TState>;
+  replayed: number;
+  truncated: boolean;
+  highWatermark: number;
+}
+
+export interface EventLogReplayStorageReadOptions {
+  sinceSeq?: number;
+  limit?: number;
+  cursor?: EventLogCursor | number | null;
+  maxBytes?: number;
+}
+
+export interface EventLogReplayStorageStats {
+  checkpointed: boolean;
+  checkpointOffset: number;
+  log: EventLogStats;
+}
+
+export interface EventLogReplayStorageOptions<TSnapshot = JsonValue> {
+  log?: EventLog<JsonValue>;
+  initialSnapshot?: TSnapshot | null;
+  initialCheckpoint?: EventLogCheckpoint<TSnapshot | null> | null;
+  capacity?: number;
+  now?: () => number;
+}
+
+export interface EventLogReplayStorage<TSnapshot = JsonValue, TEntry = JsonValue> {
+  readonly log: EventLog<JsonValue>;
+  load(): TSnapshot | null;
+  save(snapshot: TSnapshot): void;
+  appendChange(entry: TEntry): EventLogRecord<JsonValue>;
+  readChangeLog(options?: EventLogReplayStorageReadOptions): TEntry[];
+  compact(snapshot?: TSnapshot): EventLogCheckpoint<TSnapshot | null>;
+  clear(): void;
+  getCheckpoint(): EventLogCheckpoint<TSnapshot | null> | null;
+  getStats(): EventLogReplayStorageStats;
 }
 
 export interface PatchEventLogValue extends JsonObject {
@@ -135,6 +203,8 @@ export function createEventLog<T extends JsonValue = JsonValue>(options: EventLo
   let appended = 0;
   let dropped = 0;
   let compacted = 0;
+  let appendBatchDepth = 0;
+  let compactAfterBatch = false;
 
   function append(input: EventLogAppendInput<T>): EventLogRecord<T> {
     const result = tryAppend(input);
@@ -160,7 +230,7 @@ export function createEventLog<T extends JsonValue = JsonValue>(options: EventLo
     records[records.length] = record;
     appended++;
 
-    if (compactByKey && compactOnAppend) compact();
+    if (compactByKey && compactOnAppend) queueAppendCompaction();
     enforceCapacity();
     return { accepted: true, record: cloneRecord(record) };
   }
@@ -177,23 +247,33 @@ export function createEventLog<T extends JsonValue = JsonValue>(options: EventLo
     let bytes = 0;
     let rejected = 0;
 
-    for (let i = 0; i < inputs.length; i++) {
-      if (accepted.length >= maxRecords) {
-        rejected += inputs.length - i;
-        break;
+    appendBatchDepth++;
+    try {
+      for (let i = 0; i < inputs.length; i++) {
+        if (accepted.length >= maxRecords) {
+          rejected += inputs.length - i;
+          break;
+        }
+        const size = maxBytes === Number.POSITIVE_INFINITY ? 0 : estimateJsonBytes(inputs[i] as unknown as JsonValue);
+        if (bytes + size > maxBytes) {
+          rejected += inputs.length - i;
+          break;
+        }
+        const result = tryAppend(inputs[i]);
+        if (!result.accepted || result.record === undefined) {
+          rejected += inputs.length - i;
+          break;
+        }
+        accepted[accepted.length] = result.record;
+        bytes += size;
       }
-      const size = maxBytes === Number.POSITIVE_INFINITY ? 0 : estimateJsonBytes(inputs[i] as unknown as JsonValue);
-      if (bytes + size > maxBytes) {
-        rejected += inputs.length - i;
-        break;
+    } finally {
+      appendBatchDepth--;
+      if (appendBatchDepth === 0 && compactAfterBatch) {
+        compactAfterBatch = false;
+        compact();
+        enforceCapacity();
       }
-      const result = tryAppend(inputs[i]);
-      if (!result.accepted || result.record === undefined) {
-        rejected += inputs.length - i;
-        break;
-      }
-      accepted[accepted.length] = result.record;
-      bytes += size;
     }
 
     return {
@@ -277,6 +357,16 @@ export function createEventLog<T extends JsonValue = JsonValue>(options: EventLo
     return removed;
   }
 
+  function truncateBefore(cursor: EventLogCursor | number): number {
+    const offset = readCursorOffset(cursor);
+    let remove = 0;
+    while (remove < records.length && records[remove].offset < offset) remove++;
+    if (remove === 0) return 0;
+    records.splice(0, remove);
+    dropped += remove;
+    return remove;
+  }
+
   function clear(): void {
     dropped += records.length;
     records.length = 0;
@@ -300,6 +390,14 @@ export function createEventLog<T extends JsonValue = JsonValue>(options: EventLo
     const remove = records.length - capacity;
     records.splice(0, remove);
     dropped += remove;
+  }
+
+  function queueAppendCompaction(): void {
+    if (appendBatchDepth !== 0 && capacity === Number.POSITIVE_INFINITY) {
+      compactAfterBatch = true;
+      return;
+    }
+    compact();
   }
 
   function readFirstOffset(): number {
@@ -341,7 +439,149 @@ export function createEventLog<T extends JsonValue = JsonValue>(options: EventLo
     read,
     createConsumer,
     compact,
+    truncateBefore,
     clear,
+    getStats
+  };
+}
+
+export function createEventLogCheckpoint<TSnapshot>(
+  log: EventLog,
+  snapshot: TSnapshot,
+  options: EventLogCheckpointOptions = {}
+): EventLogCheckpoint<TSnapshot> {
+  return {
+    cursor: { offset: readCursorOffset(options.cursor === undefined ? log.nextOffset : options.cursor) },
+    snapshot: cloneStorageValue(snapshot),
+    timestamp: options.timestamp === undefined ? Date.now() : Number(options.timestamp),
+    highWatermark: log.highWatermark,
+    ...(options.metadata === undefined ? {} : { metadata: cloneJson(options.metadata) })
+  };
+}
+
+export function replayEventLog<TState, TValue extends JsonValue = JsonValue>(
+  log: EventLog<TValue>,
+  checkpoint: EventLogCheckpoint<TState>,
+  reducer: EventLogReplayReducer<TState, TValue>,
+  options: EventLogReplayOptions = {}
+): EventLogReplayResult<TState> {
+  if (typeof reducer !== 'function') throw new TypeError('event log replay reducer must be a function');
+  const batchSize = options.batchSize === undefined ? 256 : Math.max(1, Math.floor(options.batchSize));
+  const maxBytes = options.maxBytesPerRead === undefined ? undefined : Math.max(0, Math.floor(options.maxBytesPerRead));
+  let state = cloneStorageValue(checkpoint.snapshot);
+  let cursor = readCursorOffset(checkpoint.cursor);
+  let replayed = 0;
+  let truncated = false;
+
+  for (;;) {
+    const readOptions: EventLogReadOptions = { limit: batchSize };
+    if (maxBytes !== undefined) readOptions.maxBytes = maxBytes;
+    const result = log.read(cursor, readOptions);
+    if (result.truncated) {
+      truncated = true;
+      if (options.strict !== false) {
+        throw new RangeError('event log replay checkpoint was truncated before offset ' + cursor);
+      }
+    }
+    for (let i = 0; i < result.records.length; i++) {
+      state = reducer(state, result.records[i]);
+      replayed++;
+    }
+    cursor = result.cursor.offset;
+    if (result.records.length === 0 || cursor >= log.nextOffset) break;
+  }
+
+  return {
+    state,
+    cursor: { offset: cursor },
+    checkpoint: createEventLogCheckpoint(log, state, {
+      cursor,
+      timestamp: checkpoint.timestamp,
+      metadata: checkpoint.metadata
+    }),
+    replayed,
+    truncated,
+    highWatermark: log.highWatermark
+  };
+}
+
+export function createEventLogReplayStorage<TSnapshot = JsonValue, TEntry = JsonValue>(
+  options: EventLogReplayStorageOptions<TSnapshot> = {}
+): EventLogReplayStorage<TSnapshot, TEntry> {
+  const log = options.log || createEventLog<JsonValue>({ capacity: options.capacity, now: options.now });
+  let checkpoint: EventLogCheckpoint<TSnapshot | null> | null = options.initialCheckpoint === undefined || options.initialCheckpoint === null
+    ? null
+    : cloneCheckpoint(options.initialCheckpoint);
+  let snapshot: TSnapshot | null = options.initialSnapshot === undefined
+    ? checkpoint === null ? null : cloneStorageValue(checkpoint.snapshot)
+    : cloneStorageValue(options.initialSnapshot);
+
+  function load(): TSnapshot | null {
+    return snapshot === null ? null : cloneStorageValue(snapshot);
+  }
+
+  function save(next: TSnapshot): void {
+    snapshot = cloneStorageValue(next);
+  }
+
+  function appendChange(entry: TEntry): EventLogRecord<JsonValue> {
+    return log.append({ value: cloneStorageValue(entry) as JsonValue });
+  }
+
+  function readChangeLog(options: EventLogReplayStorageReadOptions = {}): TEntry[] {
+    const limit = options.limit === undefined ? Number.POSITIVE_INFINITY : Math.max(0, Math.floor(options.limit));
+    if (limit === 0) return [];
+    const cursor = options.cursor === undefined ? log.firstOffset : options.cursor;
+    const result = log.read(cursor, {
+      maxBytes: options.maxBytes
+    });
+    const out: TEntry[] = [];
+    for (let i = 0; i < result.records.length; i++) {
+      const value = result.records[i].value;
+      if (options.sinceSeq !== undefined && readEntrySeq(value) <= options.sinceSeq) continue;
+      out[out.length] = cloneStorageValue(value as TEntry);
+      if (out.length >= limit) break;
+    }
+    return out;
+  }
+
+  function compact(next?: TSnapshot): EventLogCheckpoint<TSnapshot | null> {
+    if (next !== undefined) save(next);
+    checkpoint = createEventLogCheckpoint(log, snapshot, {
+      cursor: log.nextOffset,
+      timestamp: options.now === undefined ? Date.now() : options.now()
+    });
+    log.truncateBefore(checkpoint.cursor);
+    return cloneCheckpoint(checkpoint);
+  }
+
+  function clear(): void {
+    snapshot = null;
+    checkpoint = null;
+    log.clear();
+  }
+
+  function getCheckpoint(): EventLogCheckpoint<TSnapshot | null> | null {
+    return checkpoint === null ? null : cloneCheckpoint(checkpoint);
+  }
+
+  function getStats(): EventLogReplayStorageStats {
+    return {
+      checkpointed: checkpoint !== null,
+      checkpointOffset: checkpoint === null ? 0 : checkpoint.cursor.offset,
+      log: log.getStats()
+    };
+  }
+
+  return {
+    log,
+    load,
+    save,
+    appendChange,
+    readChangeLog,
+    compact,
+    clear,
+    getCheckpoint,
     getStats
   };
 }
@@ -428,6 +668,28 @@ function readCursorOffset(cursor: EventLogCursor | number | null | undefined): n
   if (cursor === null || cursor === undefined) return 0;
   if (typeof cursor === 'number') return Math.max(0, Math.floor(cursor));
   return Math.max(0, Math.floor(cursor.offset || 0));
+}
+
+function cloneCheckpoint<TSnapshot>(checkpoint: EventLogCheckpoint<TSnapshot>): EventLogCheckpoint<TSnapshot> {
+  return {
+    cursor: { offset: readCursorOffset(checkpoint.cursor) },
+    snapshot: cloneStorageValue(checkpoint.snapshot),
+    timestamp: Number(checkpoint.timestamp),
+    highWatermark: Math.floor(Number(checkpoint.highWatermark) || 0),
+    ...(checkpoint.metadata === undefined ? {} : { metadata: cloneJson(checkpoint.metadata) })
+  };
+}
+
+function cloneStorageValue<T>(value: T): T {
+  return cloneJson(value as unknown as JsonValue) as unknown as T;
+}
+
+function readEntrySeq(value: JsonValue): number {
+  if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+    const seq = Number((value as JsonObject).seq);
+    if (Number.isFinite(seq)) return seq;
+  }
+  return Number.POSITIVE_INFINITY;
 }
 
 function estimateJsonBytes(value: JsonValue): number {
