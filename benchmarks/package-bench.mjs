@@ -4,10 +4,13 @@ import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
 import { diff } from '@shapeshift-labs/frontier';
 import {
+  applyPatchEventRecord,
   appendPatchEvent,
   createEventLog,
   createEventLogCheckpoint,
   createEventLogReplayStorage,
+  diffBetweenTimes,
+  stateAtTime,
   replayEventLog
 } from '../dist/index.js';
 
@@ -26,6 +29,7 @@ const patch = diff(
 const replayLog = seededLog(4096);
 const consumerLog = seededLog(512);
 const consumer = consumerLog.createConsumer('bench');
+const temporalFixture = createTemporalFixture();
 const compactBatchInputs = Array.from({ length: 1024 }, (_, i) => ({
   key: 'entity:' + (i & 127),
   value: { revision: i }
@@ -64,6 +68,24 @@ const rows = [
     for (let i = 0; i < 64; i++) log.append({ value: { delta: 1 } });
     sink += replayEventLog(log, checkpoint, (state, record) => ({ total: state.total + record.value.delta })).state.total;
   }),
+  runRow('State at offset, 64 patch events', 1000, () => {
+    const result = stateAtTime(
+      temporalFixture.log,
+      temporalFixture.checkpoint,
+      applyPatchEventRecord,
+      { at: 64 }
+    );
+    sink += result.cursor.offset;
+  }),
+  runRow('Diff between offsets, 64 patch events', 1000, () => {
+    const result = diffBetweenTimes(
+      temporalFixture.log,
+      temporalFixture.checkpoint,
+      applyPatchEventRecord,
+      { from: 16, to: 64 }
+    );
+    sink += result.patch.length;
+  }),
   runRow('Replay storage append/read checkpoint', 1000, () => {
     const storage = createEventLogReplayStorage({ initialSnapshot: { count: 0 }, now: () => 1 });
     for (let i = 0; i < 32; i++) storage.appendChange({ seq: i + 1, type: 'change', value: i });
@@ -82,6 +104,21 @@ function seededLog(count) {
   const log = createEventLog({ capacity: count + 1, now: () => 1 });
   for (let i = 0; i < count; i++) log.append({ key: 'k' + (i & 255), value: { i, value: i & 7 } });
   return log;
+}
+
+function createTemporalFixture() {
+  const log = createEventLog({ now: () => 1 });
+  const checkpoint = createEventLogCheckpoint(log, { rows: [{ id: 'a', score: 0 }], meta: { tick: 0 } }, { timestamp: 1 });
+  let current = checkpoint.snapshot;
+  for (let i = 1; i <= 64; i++) {
+    const next = {
+      rows: [{ id: 'a', score: i }, { id: 'b', score: i & 7 }],
+      meta: { tick: i }
+    };
+    appendPatchEvent(log, diff(current, next, { arrayKey: 'id' }), { timestamp: i + 1 });
+    current = next;
+  }
+  return { log, checkpoint };
 }
 
 function measure(fn, inner) {

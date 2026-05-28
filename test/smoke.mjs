@@ -1,10 +1,13 @@
 import assert from 'node:assert';
-import { diff } from '@shapeshift-labs/frontier';
+import { applyPatch, diff } from '@shapeshift-labs/frontier';
 import {
+  applyPatchEventRecord,
   appendPatchEvent,
   createEventLog,
   createEventLogCheckpoint,
   createEventLogReplayStorage,
+  diffBetweenTimes,
+  stateAtTime,
   replayEventLog
 } from '../dist/index.js';
 import { createEventLog as createEventLogSubpath } from '../dist/event-log.js';
@@ -93,6 +96,29 @@ assert.strictEqual(createEventLogSubpath, createEventLog);
 }
 
 {
+  const scheduled = [];
+  const scheduler = {
+    schedule(task) {
+      scheduled.push(task);
+      return task;
+    },
+    run() {
+      while (scheduled.length !== 0) scheduled.shift().run();
+    }
+  };
+  const log = createEventLog({ compactByKey: true, compactOnAppend: true, scheduler });
+  log.append({ key: 'a', value: { version: 1 } });
+  log.append({ key: 'a', value: { version: 2 } });
+  log.append({ key: 'b', value: { version: 1 } });
+  assert.strictEqual(scheduled.length, 1);
+  assert.strictEqual(scheduled[0].type, 'frontier.event-log.compact');
+  assert.strictEqual(log.read(0).records.length, 3);
+  scheduler.run();
+  assert.deepStrictEqual(log.read(0).records.map((record) => record.value.version), [2, 1]);
+  assert.strictEqual(log.getStats().compacted, 1);
+}
+
+{
   const log = createEventLog();
   for (let i = 0; i < 5; i++) log.append({ value: { i } });
   const consumer = log.createConsumer('agent');
@@ -156,6 +182,49 @@ assert.strictEqual(createEventLogSubpath, createEventLog);
   assert.strictEqual(event.value.kind, 'patch');
   assert.deepStrictEqual(event.value.patch, patch);
   assert.strictEqual(event.value.metadata.source, 'unit');
+}
+
+{
+  let now = 100;
+  const log = createEventLog({ now: () => now++ });
+  const base = { count: 0, todos: [] };
+  const checkpoint = createEventLogCheckpoint(log, base, { timestamp: 99 });
+  const states = [base];
+  let current = base;
+  for (let i = 1; i <= 4; i++) {
+    const next = { count: i, todos: [{ id: 'a', done: i >= 3 }] };
+    appendPatchEvent(log, diff(current, next, { arrayKey: 'id' }), { timestamp: 99 + i });
+    states[states.length] = next;
+    current = next;
+  }
+
+  const atOffset = stateAtTime(log, checkpoint, applyPatchEventRecord, { at: 2 });
+  assert.deepStrictEqual(atOffset.state, states[2]);
+  assert.deepStrictEqual(atOffset.cursor, { offset: 2 });
+  assert.strictEqual(atOffset.replayed, 2);
+
+  const atTimestamp = stateAtTime(log, checkpoint, applyPatchEventRecord, { at: { timestamp: 102 } });
+  assert.deepStrictEqual(atTimestamp.state, states[3]);
+  assert.deepStrictEqual(atTimestamp.cursor, { offset: 3 });
+
+  const temporalDiff = diffBetweenTimes(log, checkpoint, applyPatchEventRecord, { from: 1, to: 4 });
+  assert.deepStrictEqual(temporalDiff.before, states[1]);
+  assert.deepStrictEqual(temporalDiff.after, states[4]);
+  assert.deepStrictEqual(applyPatch(temporalDiff.before, temporalDiff.patch, { cloneValues: true }), temporalDiff.after);
+  assert.strictEqual(temporalDiff.from.replayed, 1);
+  assert.strictEqual(temporalDiff.to.replayed, 3);
+
+  assert.throws(
+    () => stateAtTime(log, checkpoint, applyPatchEventRecord, { at: { timestamp: 90 } }),
+    /precedes checkpoint timestamp/
+  );
+  assert.throws(
+    () => diffBetweenTimes(log, checkpoint, applyPatchEventRecord, { from: 3, to: 2 }),
+    /end precedes start/
+  );
+  const lenient = stateAtTime(log, checkpoint, applyPatchEventRecord, { at: { timestamp: 90 }, strict: false });
+  assert.strictEqual(lenient.truncated, true);
+  assert.deepStrictEqual(lenient.state, base);
 }
 
 console.log('frontier event-log smoke passed');

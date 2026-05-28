@@ -22,8 +22,11 @@ The published Frontier package family is generated from one shared package catal
 - [`@shapeshift-labs/frontier-state-cache-file`](https://www.npmjs.com/package/@shapeshift-labs/frontier-state-cache-file): Structured file persistence adapter for Frontier state-cache snapshots and change logs.
 - [`@shapeshift-labs/frontier-state-cache-sql`](https://www.npmjs.com/package/@shapeshift-labs/frontier-state-cache-sql): SQL persistence adapter for Frontier state-cache snapshots and change logs.
 - [`@shapeshift-labs/frontier-schema`](https://www.npmjs.com/package/@shapeshift-labs/frontier-schema): JSON Schema validation, Frontier profile generation, CloudEvent envelopes, and query/table schema helpers.
+- [`@shapeshift-labs/frontier-scheduler`](https://www.npmjs.com/package/@shapeshift-labs/frontier-scheduler): Deterministic work scheduling, lanes, cancellation, backpressure, frame policies, replay snapshots, and work graphs.
 - [`@shapeshift-labs/frontier-logging`](https://www.npmjs.com/package/@shapeshift-labs/frontier-logging): Opt-in structured logging, browser telemetry, file sinks, exporters, benchmark traces, and Frontier patch/update summaries.
 - [`@shapeshift-labs/frontier-mutation`](https://www.npmjs.com/package/@shapeshift-labs/frontier-mutation): Explicit mutation and selector plans compiled to Frontier patches or CRDT operations.
+- [`@shapeshift-labs/frontier-virtual`](https://www.npmjs.com/package/@shapeshift-labs/frontier-virtual): DOM-neutral virtualization, layout providers, range materialization, grids, spatial culling, frustum culling, and serializable layout state.
+- [`@shapeshift-labs/frontier-dom`](https://www.npmjs.com/package/@shapeshift-labs/frontier-dom): Patch-native DOM and host renderer bindings, manifest hydration, JSX runtime/compiler helpers, SSR, devtools, and logging bridges.
 - [`@shapeshift-labs/frontier-crdt`](https://www.npmjs.com/package/@shapeshift-labs/frontier-crdt): Native CRDT documents, update tooling, awareness, branches, conflict introspection, version frames, and undo.
 - [`@shapeshift-labs/frontier-crdt-sync`](https://www.npmjs.com/package/@shapeshift-labs/frontier-crdt-sync): CRDT sync endpoints, repo/storage/provider contracts, document URLs, local networks, model checking, forensics, and text binding contracts.
 - [`@shapeshift-labs/frontier-crdt-websocket`](https://www.npmjs.com/package/@shapeshift-labs/frontier-crdt-websocket): WebSocket client/server transports for Frontier CRDT sync providers.
@@ -47,8 +50,11 @@ Package source repositories:
 - [`siliconjungle/-shapeshift-labs-frontier-state-cache-sql`](https://github.com/siliconjungle/-shapeshift-labs-frontier-state-cache-sql)
 - [`siliconjungle/-shapeshift-labs-frontier-schema`](https://github.com/siliconjungle/-shapeshift-labs-frontier-schema)
 - [`siliconjungle/-shapeshift-labs-frontier-event-log`](https://github.com/siliconjungle/-shapeshift-labs-frontier-event-log)
+- [`siliconjungle/-shapeshift-labs-frontier-scheduler`](https://github.com/siliconjungle/-shapeshift-labs-frontier-scheduler)
 - [`siliconjungle/-shapeshift-labs-frontier-logging`](https://github.com/siliconjungle/-shapeshift-labs-frontier-logging)
 - [`siliconjungle/-shapeshift-labs-frontier-mutation`](https://github.com/siliconjungle/-shapeshift-labs-frontier-mutation)
+- [`siliconjungle/-shapeshift-labs-frontier-virtual`](https://github.com/siliconjungle/-shapeshift-labs-frontier-virtual)
+- [`siliconjungle/-shapeshift-labs-frontier-dom`](https://github.com/siliconjungle/-shapeshift-labs-frontier-dom)
 - [`siliconjungle/-shapeshift-labs-frontier-crdt`](https://github.com/siliconjungle/-shapeshift-labs-frontier-crdt)
 - [`siliconjungle/-shapeshift-labs-frontier-crdt-sync`](https://github.com/siliconjungle/-shapeshift-labs-frontier-crdt-sync)
 - [`siliconjungle/-shapeshift-labs-frontier-crdt-websocket`](https://github.com/siliconjungle/-shapeshift-labs-frontier-crdt-websocket)
@@ -101,11 +107,14 @@ console.log(replay.records, replay.cursor);
 
 ```ts
 import {
+  applyPatchEventRecord,
   appendPatchEvent,
   createEventLogCheckpoint,
   createEventLog,
   createEventLogReplayStorage,
+  diffBetweenTimes,
   replayEventLog,
+  stateAtTime,
   type EventLog,
   type EventLogCheckpoint,
   type EventLogConsumer,
@@ -127,6 +136,7 @@ Useful options:
 - `compactByKey`: enables key-based compaction.
 - `compactOnAppend`: compacts after each append when `compactByKey` is enabled.
 - `dropTombstones`: removes latest `null` keyed records during compaction.
+- `scheduler`: optional structural scheduler for queued append compaction.
 - `initialOffset`: starting offset.
 - `now`: timestamp supplier for deterministic tests.
 
@@ -160,6 +170,21 @@ const result = replayEventLog(log, checkpoint, (state, record) => ({
 
 `createEventLogCheckpoint()` captures an application snapshot plus an event-log cursor. `replayEventLog()` resumes from that cursor in bounded batches and returns the replayed state, cursor, replay count, and a fresh checkpoint. `createEventLogReplayStorage()` provides the same snapshot-plus-bounded-change-log shape used by state-cache persistence without making state-cache depend on event-log.
 
+### Temporal State And Diff
+
+`stateAtTime()` materializes state at an offset, cursor, high-watermark, or timestamp by replaying from a checkpoint. `diffBetweenTimes()` materializes two temporal states and returns a Frontier patch between them. For patch-event logs, `applyPatchEventRecord()` is the reducer.
+
+```ts
+const atCursor = stateAtTime(log, checkpoint, applyPatchEventRecord, {
+  at: { offset: 128 }
+});
+
+const change = diffBetweenTimes(log, checkpoint, applyPatchEventRecord, {
+  from: { offset: 64 },
+  to: { timestamp: Date.now() }
+});
+```
+
 ### Patch Events
 
 ```ts
@@ -186,6 +211,7 @@ This package owns:
 
 - in-memory event logs,
 - snapshot checkpoints and bounded replay helpers,
+- temporal state-at-time and diff-between-times helpers,
 - generic replay storage for snapshot plus change-log adapters,
 - append batching and bounded replay windows,
 - consumer cursors and acknowledgements,
@@ -215,7 +241,7 @@ npm run bench
 npm run pack:dry
 ```
 
-The package test suite covers root and subpath imports, append/read behavior, clone isolation, retention policies, keyed compaction, batch limits, consumers, checkpoint replay, replay storage, patch events, and randomized operation sequences.
+The package test suite covers root and subpath imports, append/read behavior, clone isolation, retention policies, keyed compaction, batch limits, consumers, checkpoint replay, temporal state/diff, replay storage, patch events, and randomized operation sequences.
 
 ## Benchmarks
 
@@ -225,18 +251,20 @@ Run the package-local benchmark:
 npm run bench
 ```
 
-Latest local package benchmark on Node v26.1.0, darwin arm64, 15 rounds:
+Latest local package benchmark on Node v26.1.0, darwin arm64, 9 rounds:
 
 | Fixture | Median | p95 |
 | --- | ---: | ---: |
-| Append keyed JSON event | 3.63 us | 4.83 us |
-| Read replay window, 32 records | 1.65 us | 2.10 us |
-| Consumer read and ack | 0.43 us | 0.54 us |
-| Compact keyed log, 1k records | 147.93 us | 173.88 us |
-| Append batch compactOnAppend, 1k records | 98.44 us | 105.96 us |
-| Replay from checkpoint, 64 records | 26.61 us | 30.18 us |
-| Replay storage append/read checkpoint | 10.35 us | 11.78 us |
-| Append Frontier patch event | 2.27 us | 2.86 us |
+| Append keyed JSON event | 3.99 us | 4.65 us |
+| Read replay window, 32 records | 1.55 us | 1.69 us |
+| Consumer read and ack | 0.43 us | 0.46 us |
+| Compact keyed log, 1k records | 156.31 us | 181.40 us |
+| Append batch compactOnAppend, 1k records | 100.82 us | 105.50 us |
+| Replay from checkpoint, 64 records | 25.43 us | 28.23 us |
+| State at offset, 64 patch events | 15.96 us | 16.14 us |
+| Diff between offsets, 64 patch events | 26.64 us | 28.25 us |
+| Replay storage append/read checkpoint | 11.16 us | 11.51 us |
+| Append Frontier patch event | 2.34 us | 2.99 us |
 
 These are Frontier-only package measurements, not competitor comparisons.
 Replay and consumer fixtures use preseeded retained logs so the timed work is read/cursor behavior, not fixture construction.

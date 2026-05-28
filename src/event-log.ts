@@ -1,4 +1,6 @@
+import { applyPatch } from '@shapeshift-labs/frontier/apply';
 import { cloneJson } from '@shapeshift-labs/frontier/clone';
+import { diff as diffJson } from '@shapeshift-labs/frontier/diff';
 import type {
   JsonObject,
   JsonValue,
@@ -33,8 +35,31 @@ export interface EventLogOptions {
   compactByKey?: boolean;
   compactOnAppend?: boolean;
   dropTombstones?: boolean;
+  scheduler?: EventLogSchedulerLike;
+  schedulerLane?: string;
+  schedulerPriority?: unknown;
+  schedulerAutoRun?: boolean;
+  schedulerRunOptions?: unknown;
   initialOffset?: number;
   now?: () => number;
+}
+
+export interface EventLogSchedulerTask {
+  id?: string;
+  type?: string;
+  lane?: string;
+  area?: string;
+  priority?: unknown;
+  units?: number;
+  key?: string;
+  metadata?: Record<string, unknown>;
+  run(context?: unknown): unknown;
+}
+
+export interface EventLogSchedulerLike {
+  schedule(task: EventLogSchedulerTask): unknown;
+  run?(options?: unknown): unknown;
+  requestRun?(options?: unknown): unknown;
 }
 
 export interface EventLogAppendResult<T extends JsonValue = JsonValue> {
@@ -144,6 +169,47 @@ export interface EventLogReplayResult<TState> {
   highWatermark: number;
 }
 
+export type EventLogTemporalPoint =
+  | number
+  | EventLogCursor
+  | {
+      offset?: number;
+      cursor?: EventLogCursor | number;
+      highWatermark?: number;
+      timestamp?: number;
+      inclusive?: boolean;
+    };
+
+export interface EventLogStateAtTimeOptions extends EventLogReplayOptions {
+  at?: EventLogTemporalPoint;
+}
+
+export interface EventLogTemporalStateResult<TState> {
+  state: TState;
+  cursor: EventLogCursor;
+  checkpoint: EventLogCheckpoint<TState>;
+  replayed: number;
+  truncated: boolean;
+  highWatermark: number;
+}
+
+export interface EventLogDiffBetweenTimesOptions<TState extends JsonValue> extends EventLogReplayOptions {
+  from: EventLogTemporalPoint;
+  to: EventLogTemporalPoint;
+  diff?: (before: TState, after: TState) => Patch;
+}
+
+export interface EventLogTemporalDiffResult<TState extends JsonValue> {
+  before: TState;
+  after: TState;
+  patch: Patch;
+  from: EventLogTemporalStateResult<TState>;
+  to: EventLogTemporalStateResult<TState>;
+  replayed: number;
+  truncated: boolean;
+  highWatermark: number;
+}
+
 export interface EventLogReplayStorageReadOptions {
   sinceSeq?: number;
   limit?: number;
@@ -197,6 +263,10 @@ export function createEventLog<T extends JsonValue = JsonValue>(options: EventLo
   const compactByKey = options.compactByKey === true;
   const compactOnAppend = options.compactOnAppend === true;
   const dropTombstones = options.dropTombstones === true;
+  const scheduler = options.scheduler;
+  const schedulerLane = options.schedulerLane ?? 'event-log';
+  const schedulerPriority = options.schedulerPriority ?? 'low';
+  const schedulerAutoRun = options.schedulerAutoRun ?? false;
   const records: EventLogRecord<T>[] = [];
   const consumers = new Map<string, EventLogConsumerImpl<T>>();
   let nextOffset = Math.max(0, Math.floor(options.initialOffset || 0));
@@ -205,6 +275,8 @@ export function createEventLog<T extends JsonValue = JsonValue>(options: EventLo
   let compacted = 0;
   let appendBatchDepth = 0;
   let compactAfterBatch = false;
+  let compactionScheduled = false;
+  let compactionTaskSeq = 0;
 
   function append(input: EventLogAppendInput<T>): EventLogRecord<T> {
     const result = tryAppend(input);
@@ -271,7 +343,7 @@ export function createEventLog<T extends JsonValue = JsonValue>(options: EventLo
       appendBatchDepth--;
       if (appendBatchDepth === 0 && compactAfterBatch) {
         compactAfterBatch = false;
-        compact();
+        queueAppendCompaction();
         enforceCapacity();
       }
     }
@@ -397,7 +469,40 @@ export function createEventLog<T extends JsonValue = JsonValue>(options: EventLo
       compactAfterBatch = true;
       return;
     }
+    if (scheduler !== undefined) {
+      scheduleCompaction();
+      return;
+    }
     compact();
+  }
+
+  function scheduleCompaction(): void {
+    if (compactionScheduled) return;
+    compactionScheduled = true;
+    try {
+      scheduler?.schedule({
+        id: 'frontier.event-log.compact:' + ++compactionTaskSeq,
+        type: 'frontier.event-log.compact',
+        lane: schedulerLane,
+        area: 'event-log',
+        priority: schedulerPriority,
+        units: 1,
+        key: 'frontier.event-log.compact',
+        metadata: { records: records.length, nextOffset },
+        run() {
+          compactionScheduled = false;
+          compact();
+          enforceCapacity();
+        }
+      });
+    } catch (error) {
+      compactionScheduled = false;
+      throw error;
+    }
+    if (schedulerAutoRun) {
+      if (typeof scheduler?.requestRun === 'function') scheduler.requestRun(options.schedulerRunOptions);
+      else if (typeof scheduler?.run === 'function') scheduler.run(options.schedulerRunOptions);
+    }
   }
 
   function readFirstOffset(): number {
@@ -503,6 +608,102 @@ export function replayEventLog<TState, TValue extends JsonValue = JsonValue>(
     truncated,
     highWatermark: log.highWatermark
   };
+}
+
+export function stateAtTime<TState, TValue extends JsonValue = JsonValue>(
+  log: EventLog<TValue>,
+  checkpoint: EventLogCheckpoint<TState>,
+  reducer: EventLogReplayReducer<TState, TValue>,
+  options: EventLogStateAtTimeOptions = {}
+): EventLogTemporalStateResult<TState> {
+  if (typeof reducer !== 'function') throw new TypeError('event log stateAtTime reducer must be a function');
+  const target = normalizeTemporalPoint(options.at === undefined ? log.nextOffset : options.at);
+  const checkpointCursor = readCursorOffset(checkpoint.cursor);
+  const batchSize = options.batchSize === undefined ? 256 : Math.max(1, Math.floor(options.batchSize));
+  const maxBytes = options.maxBytesPerRead === undefined ? undefined : Math.max(0, Math.floor(options.maxBytesPerRead));
+  let state = cloneStorageValue(checkpoint.snapshot);
+  let cursor = checkpointCursor;
+  let replayed = 0;
+  let truncated = false;
+
+  if (target.kind === 'offset' && target.offset < checkpointCursor) {
+    if (options.strict !== false) throw new RangeError('event log temporal target precedes checkpoint offset ' + checkpointCursor);
+    return makeTemporalStateResult(log, checkpoint, state, cursor, replayed, true);
+  }
+  if (target.kind === 'timestamp' && target.timestamp < Number(checkpoint.timestamp)) {
+    if (options.strict !== false) throw new RangeError('event log temporal target precedes checkpoint timestamp ' + checkpoint.timestamp);
+    return makeTemporalStateResult(log, checkpoint, state, cursor, replayed, true);
+  }
+
+  for (;;) {
+    if (target.kind === 'offset' && cursor >= target.offset) break;
+    const readOptions: EventLogReadOptions = { limit: batchSize };
+    if (maxBytes !== undefined) readOptions.maxBytes = maxBytes;
+    const result = log.read(cursor, readOptions);
+    if (result.truncated) {
+      truncated = true;
+      if (options.strict !== false) {
+        throw new RangeError('event log temporal checkpoint was truncated before offset ' + cursor);
+      }
+    }
+
+    let stopped = false;
+    for (let i = 0; i < result.records.length; i++) {
+      const record = result.records[i];
+      if (temporalPointStopsBeforeRecord(target, record)) {
+        stopped = true;
+        break;
+      }
+      state = reducer(state, record);
+      cursor = record.offset + 1;
+      replayed++;
+    }
+    if (stopped || result.records.length === 0 || cursor >= log.nextOffset) break;
+  }
+
+  return makeTemporalStateResult(log, checkpoint, state, cursor, replayed, truncated);
+}
+
+export function diffBetweenTimes<TState extends JsonValue, TValue extends JsonValue = JsonValue>(
+  log: EventLog<TValue>,
+  checkpoint: EventLogCheckpoint<TState>,
+  reducer: EventLogReplayReducer<TState, TValue>,
+  options: EventLogDiffBetweenTimesOptions<TState>
+): EventLogTemporalDiffResult<TState> {
+  if (options === null || typeof options !== 'object') throw new TypeError('event log temporal diff options must be an object');
+  const fromTarget = normalizeTemporalPoint(options.from);
+  const toTarget = normalizeTemporalPoint(options.to);
+  if (temporalPointPrecedes(toTarget, fromTarget)) throw new RangeError('event log temporal diff end precedes start');
+  const from = stateAtTime(log, checkpoint, reducer, { ...options, at: options.from });
+  const toCheckpoint: EventLogCheckpoint<TState> = {
+    cursor: from.cursor,
+    snapshot: from.state,
+    timestamp: from.checkpoint.timestamp,
+    highWatermark: from.highWatermark,
+    metadata: from.checkpoint.metadata
+  };
+  const to = stateAtTime(log, toCheckpoint, reducer, { ...options, at: options.to });
+  const diffFn = options.diff || ((before: TState, after: TState) => diffJson(before, after));
+  return {
+    before: cloneStorageValue(from.state),
+    after: cloneStorageValue(to.state),
+    patch: diffFn(from.state, to.state),
+    from,
+    to,
+    replayed: from.replayed + to.replayed,
+    truncated: from.truncated || to.truncated,
+    highWatermark: log.highWatermark
+  };
+}
+
+export function applyPatchEventRecord<TState extends JsonValue>(
+  state: TState,
+  record: EventLogRecord<PatchEventLogValue>
+): TState {
+  if (record.value.kind !== 'patch' || !Array.isArray(record.value.patch)) {
+    throw new TypeError('event log record is not a Frontier patch event');
+  }
+  return applyPatch(state, record.value.patch, { cloneValues: true }) as TState;
 }
 
 export function createEventLogReplayStorage<TSnapshot = JsonValue, TEntry = JsonValue>(
@@ -677,6 +878,71 @@ function cloneCheckpoint<TSnapshot>(checkpoint: EventLogCheckpoint<TSnapshot>): 
     timestamp: Number(checkpoint.timestamp),
     highWatermark: Math.floor(Number(checkpoint.highWatermark) || 0),
     ...(checkpoint.metadata === undefined ? {} : { metadata: cloneJson(checkpoint.metadata) })
+  };
+}
+
+type NormalizedTemporalPoint =
+  | { kind: 'offset'; offset: number }
+  | { kind: 'timestamp'; timestamp: number; inclusive: boolean };
+
+function normalizeTemporalPoint(point: EventLogTemporalPoint): NormalizedTemporalPoint {
+  if (typeof point === 'number') return { kind: 'offset', offset: Math.max(0, Math.floor(point)) };
+  if (point === null || typeof point !== 'object') throw new TypeError('event log temporal point must be an offset, cursor, or timestamp object');
+  if ('timestamp' in point && point.timestamp !== undefined) {
+    const timestamp = Number(point.timestamp);
+    if (!Number.isFinite(timestamp)) throw new TypeError('event log temporal timestamp must be finite');
+    return { kind: 'timestamp', timestamp, inclusive: point.inclusive !== false };
+  }
+  if ('highWatermark' in point && point.highWatermark !== undefined) {
+    const highWatermark = Number(point.highWatermark);
+    if (!Number.isFinite(highWatermark)) throw new TypeError('event log temporal highWatermark must be finite');
+    return { kind: 'offset', offset: Math.max(0, Math.floor(highWatermark) + 1) };
+  }
+  if ('offset' in point && point.offset !== undefined) {
+    const offset = Number(point.offset);
+    if (!Number.isFinite(offset)) throw new TypeError('event log temporal offset must be finite');
+    return { kind: 'offset', offset: Math.max(0, Math.floor(offset)) };
+  }
+  if ('cursor' in point && point.cursor !== undefined) {
+    return { kind: 'offset', offset: readCursorOffset(point.cursor) };
+  }
+  return { kind: 'offset', offset: readCursorOffset(point as EventLogCursor) };
+}
+
+function temporalPointStopsBeforeRecord<T extends JsonValue>(
+  target: NormalizedTemporalPoint,
+  record: EventLogRecord<T>
+): boolean {
+  if (target.kind === 'offset') return record.offset >= target.offset;
+  return target.inclusive ? record.timestamp > target.timestamp : record.timestamp >= target.timestamp;
+}
+
+function temporalPointPrecedes(left: NormalizedTemporalPoint, right: NormalizedTemporalPoint): boolean {
+  if (left.kind !== right.kind) return false;
+  if (left.kind === 'offset' && right.kind === 'offset') return left.offset < right.offset;
+  if (left.kind === 'timestamp' && right.kind === 'timestamp') return left.timestamp < right.timestamp;
+  return false;
+}
+
+function makeTemporalStateResult<TState>(
+  log: EventLog,
+  checkpoint: EventLogCheckpoint<TState>,
+  state: TState,
+  cursor: number,
+  replayed: number,
+  truncated: boolean
+): EventLogTemporalStateResult<TState> {
+  return {
+    state: cloneStorageValue(state),
+    cursor: { offset: cursor },
+    checkpoint: createEventLogCheckpoint(log, state, {
+      cursor,
+      timestamp: checkpoint.timestamp,
+      metadata: checkpoint.metadata
+    }),
+    replayed,
+    truncated,
+    highWatermark: log.highWatermark
   };
 }
 

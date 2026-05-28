@@ -1,8 +1,11 @@
 export {
+  applyPatchEventRecord,
   appendPatchEvent,
   createEventLog,
   createEventLogCheckpoint,
   createEventLogReplayStorage,
+  diffBetweenTimes,
+  stateAtTime,
   replayEventLog
 } from './event-log.js';
 
@@ -30,7 +33,14 @@ export type {
   EventLogReplayStorageOptions,
   EventLogReplayStorageReadOptions,
   EventLogReplayStorageStats,
+  EventLogSchedulerLike,
+  EventLogSchedulerTask,
   EventLogStats,
+  EventLogDiffBetweenTimesOptions,
   PatchEventLogOptions,
-  PatchEventLogValue
+  PatchEventLogValue,
+  EventLogStateAtTimeOptions,
+  EventLogTemporalDiffResult,
+  EventLogTemporalPoint,
+  EventLogTemporalStateResult
 } from './event-log.js';
