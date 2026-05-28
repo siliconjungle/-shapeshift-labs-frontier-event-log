@@ -68,6 +68,10 @@ export interface EventLogAppendResult<T extends JsonValue = JsonValue> {
   reason?: EventLogAppendRejectReason;
 }
 
+type EventLogStoredAppendResult<T extends JsonValue = JsonValue> =
+  | { accepted: true; record: EventLogRecord<T> }
+  | { accepted: false; reason: EventLogAppendRejectReason };
+
 export interface EventLogBatchOptions {
   maxRecords?: number;
   maxBytes?: number;
@@ -287,6 +291,12 @@ export function createEventLog<T extends JsonValue = JsonValue>(options: EventLo
   }
 
   function tryAppend(input: EventLogAppendInput<T>): EventLogAppendResult<T> {
+    const result = appendStored(input, true);
+    if (!result.accepted) return result;
+    return { accepted: true, record: cloneRecord(result.record) };
+  }
+
+  function appendStored(input: EventLogAppendInput<T>, scheduleCompaction: boolean): EventLogStoredAppendResult<T> {
     if (input === null || typeof input !== 'object') {
       throw new TypeError('event log append input must be an object');
     }
@@ -302,9 +312,9 @@ export function createEventLog<T extends JsonValue = JsonValue>(options: EventLo
     records[records.length] = record;
     appended++;
 
-    if (compactByKey && compactOnAppend) queueAppendCompaction();
+    if (scheduleCompaction && compactByKey && compactOnAppend) queueAppendCompaction();
     enforceCapacity();
-    return { accepted: true, record: cloneRecord(record) };
+    return { accepted: true, record };
   }
 
   function appendBatch(inputs: readonly EventLogAppendInput<T>[], batchOptions: EventLogBatchOptions = {}): EventLogBatchAppendResult<T> {
@@ -315,14 +325,18 @@ export function createEventLog<T extends JsonValue = JsonValue>(options: EventLo
     const maxBytes = batchOptions.maxBytes === undefined
       ? Number.POSITIVE_INFINITY
       : Math.max(0, Math.floor(batchOptions.maxBytes));
-    const accepted: EventLogRecord<T>[] = [];
+    const acceptedCapacity = Number.isFinite(maxRecords) ? Math.min(maxRecords, inputs.length) : inputs.length;
+    const accepted = new Array<EventLogRecord<T>>(acceptedCapacity);
+    const deferBatchCompaction = compactByKey && compactOnAppend && capacity === Number.POSITIVE_INFINITY;
+    let acceptedCount = 0;
     let bytes = 0;
     let rejected = 0;
+    let batchCompactionRequested = false;
 
     appendBatchDepth++;
     try {
       for (let i = 0; i < inputs.length; i++) {
-        if (accepted.length >= maxRecords) {
+        if (acceptedCount >= maxRecords) {
           rejected += inputs.length - i;
           break;
         }
@@ -331,22 +345,25 @@ export function createEventLog<T extends JsonValue = JsonValue>(options: EventLo
           rejected += inputs.length - i;
           break;
         }
-        const result = tryAppend(inputs[i]);
+        const result = appendStored(inputs[i], !deferBatchCompaction);
         if (!result.accepted || result.record === undefined) {
           rejected += inputs.length - i;
           break;
         }
-        accepted[accepted.length] = result.record;
+        accepted[acceptedCount++] = cloneRecord(result.record);
+        if (deferBatchCompaction) batchCompactionRequested = true;
         bytes += size;
       }
     } finally {
       appendBatchDepth--;
+      if (batchCompactionRequested) compactAfterBatch = true;
       if (appendBatchDepth === 0 && compactAfterBatch) {
         compactAfterBatch = false;
         queueAppendCompaction();
         enforceCapacity();
       }
     }
+    accepted.length = acceptedCount;
 
     return {
       records: accepted,
