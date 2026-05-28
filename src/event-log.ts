@@ -35,8 +35,31 @@ export interface EventLogOptions {
   compactByKey?: boolean;
   compactOnAppend?: boolean;
   dropTombstones?: boolean;
+  scheduler?: EventLogSchedulerLike;
+  schedulerLane?: string;
+  schedulerPriority?: unknown;
+  schedulerAutoRun?: boolean;
+  schedulerRunOptions?: unknown;
   initialOffset?: number;
   now?: () => number;
+}
+
+export interface EventLogSchedulerTask {
+  id?: string;
+  type?: string;
+  lane?: string;
+  area?: string;
+  priority?: unknown;
+  units?: number;
+  key?: string;
+  metadata?: Record<string, unknown>;
+  run(context?: unknown): unknown;
+}
+
+export interface EventLogSchedulerLike {
+  schedule(task: EventLogSchedulerTask): unknown;
+  run?(options?: unknown): unknown;
+  requestRun?(options?: unknown): unknown;
 }
 
 export interface EventLogAppendResult<T extends JsonValue = JsonValue> {
@@ -240,6 +263,10 @@ export function createEventLog<T extends JsonValue = JsonValue>(options: EventLo
   const compactByKey = options.compactByKey === true;
   const compactOnAppend = options.compactOnAppend === true;
   const dropTombstones = options.dropTombstones === true;
+  const scheduler = options.scheduler;
+  const schedulerLane = options.schedulerLane ?? 'event-log';
+  const schedulerPriority = options.schedulerPriority ?? 'low';
+  const schedulerAutoRun = options.schedulerAutoRun ?? false;
   const records: EventLogRecord<T>[] = [];
   const consumers = new Map<string, EventLogConsumerImpl<T>>();
   let nextOffset = Math.max(0, Math.floor(options.initialOffset || 0));
@@ -248,6 +275,8 @@ export function createEventLog<T extends JsonValue = JsonValue>(options: EventLo
   let compacted = 0;
   let appendBatchDepth = 0;
   let compactAfterBatch = false;
+  let compactionScheduled = false;
+  let compactionTaskSeq = 0;
 
   function append(input: EventLogAppendInput<T>): EventLogRecord<T> {
     const result = tryAppend(input);
@@ -314,7 +343,7 @@ export function createEventLog<T extends JsonValue = JsonValue>(options: EventLo
       appendBatchDepth--;
       if (appendBatchDepth === 0 && compactAfterBatch) {
         compactAfterBatch = false;
-        compact();
+        queueAppendCompaction();
         enforceCapacity();
       }
     }
@@ -440,7 +469,40 @@ export function createEventLog<T extends JsonValue = JsonValue>(options: EventLo
       compactAfterBatch = true;
       return;
     }
+    if (scheduler !== undefined) {
+      scheduleCompaction();
+      return;
+    }
     compact();
+  }
+
+  function scheduleCompaction(): void {
+    if (compactionScheduled) return;
+    compactionScheduled = true;
+    try {
+      scheduler?.schedule({
+        id: 'frontier.event-log.compact:' + ++compactionTaskSeq,
+        type: 'frontier.event-log.compact',
+        lane: schedulerLane,
+        area: 'event-log',
+        priority: schedulerPriority,
+        units: 1,
+        key: 'frontier.event-log.compact',
+        metadata: { records: records.length, nextOffset },
+        run() {
+          compactionScheduled = false;
+          compact();
+          enforceCapacity();
+        }
+      });
+    } catch (error) {
+      compactionScheduled = false;
+      throw error;
+    }
+    if (schedulerAutoRun) {
+      if (typeof scheduler?.requestRun === 'function') scheduler.requestRun(options.schedulerRunOptions);
+      else if (typeof scheduler?.run === 'function') scheduler.run(options.schedulerRunOptions);
+    }
   }
 
   function readFirstOffset(): number {

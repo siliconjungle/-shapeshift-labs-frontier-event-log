@@ -96,6 +96,29 @@ assert.strictEqual(createEventLogSubpath, createEventLog);
 }
 
 {
+  const scheduled = [];
+  const scheduler = {
+    schedule(task) {
+      scheduled.push(task);
+      return task;
+    },
+    run() {
+      while (scheduled.length !== 0) scheduled.shift().run();
+    }
+  };
+  const log = createEventLog({ compactByKey: true, compactOnAppend: true, scheduler });
+  log.append({ key: 'a', value: { version: 1 } });
+  log.append({ key: 'a', value: { version: 2 } });
+  log.append({ key: 'b', value: { version: 1 } });
+  assert.strictEqual(scheduled.length, 1);
+  assert.strictEqual(scheduled[0].type, 'frontier.event-log.compact');
+  assert.strictEqual(log.read(0).records.length, 3);
+  scheduler.run();
+  assert.deepStrictEqual(log.read(0).records.map((record) => record.value.version), [2, 1]);
+  assert.strictEqual(log.getStats().compacted, 1);
+}
+
+{
   const log = createEventLog();
   for (let i = 0; i < 5; i++) log.append({ value: { i } });
   const consumer = log.createConsumer('agent');

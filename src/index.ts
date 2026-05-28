@@ -33,6 +33,8 @@ export type {
   EventLogReplayStorageOptions,
   EventLogReplayStorageReadOptions,
   EventLogReplayStorageStats,
+  EventLogSchedulerLike,
+  EventLogSchedulerTask,
   EventLogStats,
   EventLogDiffBetweenTimesOptions,
   PatchEventLogOptions,

@@ -17,6 +17,7 @@ import {
   type EventLogRecord,
   type EventLogReplayResult,
   type EventLogReplayStorage,
+  type EventLogSchedulerTask,
   type EventLogTemporalDiffResult,
   type EventLogTemporalPoint,
   type EventLogTemporalStateResult,
@@ -24,7 +25,17 @@ import {
 } from '../dist/index.js';
 import { createEventLog as createEventLogSubpath } from '../dist/event-log.js';
 
-const typedEventLog: EventLog<JsonObject> = createEventLog<JsonObject>({ capacity: 128 });
+const typedScheduler = {
+  schedule(task: EventLogSchedulerTask): unknown {
+    task.run();
+    return task;
+  }
+};
+const typedEventLog: EventLog<JsonObject> = createEventLog<JsonObject>({
+  capacity: 128,
+  scheduler: typedScheduler,
+  schedulerAutoRun: true
+});
 const typedEventRecord: EventLogRecord<JsonObject> = typedEventLog.append({
   key: 'typed',
   value: { ok: true }
