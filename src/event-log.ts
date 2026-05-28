@@ -365,14 +365,35 @@ export function createEventLog<T extends JsonValue = JsonValue>(options: EventLo
     const start = Math.max(requested, firstAvailable);
     const limit = readOptions.limit === undefined ? Number.POSITIVE_INFINITY : Math.max(0, Math.floor(readOptions.limit));
     const maxBytes = readOptions.maxBytes === undefined ? Number.POSITIVE_INFINITY : Math.max(0, Math.floor(readOptions.maxBytes));
-    const out: EventLogRecord<T>[] = [];
     let bytes = 0;
     let cursorOffset = start;
     const startIndex = findRecordIndex(start);
 
+    if (maxBytes === Number.POSITIVE_INFINITY) {
+      const count = limit === Number.POSITIVE_INFINITY
+        ? records.length - startIndex
+        : Math.min(limit, records.length - startIndex);
+      const out = new Array<EventLogRecord<T>>(count);
+      for (let i = 0; i < count; i++) {
+        const record = records[startIndex + i];
+        out[i] = cloneRecord(record);
+        cursorOffset = record.offset + 1;
+      }
+      return {
+        records: out,
+        cursor: { offset: cursorOffset },
+        firstOffset: firstAvailable,
+        nextOffset,
+        highWatermark: readHighWatermark(),
+        truncated: requested < firstAvailable,
+        lag: readLag(cursorOffset)
+      };
+    }
+
+    const out: EventLogRecord<T>[] = [];
     for (let i = startIndex; i < records.length && out.length < limit; i++) {
       const record = records[i];
-      const size = maxBytes === Number.POSITIVE_INFINITY ? 0 : estimateJsonBytes(record as unknown as JsonValue);
+      const size = estimateJsonBytes(record as unknown as JsonValue);
       if (bytes + size > maxBytes) break;
       out[out.length] = cloneRecord(record);
       cursorOffset = record.offset + 1;

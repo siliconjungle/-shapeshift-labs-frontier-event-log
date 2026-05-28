@@ -1,0 +1,60 @@
+{
+  "package": "@shapeshift-labs/frontier-event-log",
+  "version": "0.1.2",
+  "generatedAt": "2026-05-28T13:40:39.698Z",
+  "node": "v26.1.0",
+  "platform": "darwin arm64",
+  "rounds": 120,
+  "rows": [
+    {
+      "fixture": "Append keyed JSON event",
+      "medianUs": 3.85,
+      "p95Us": 4.45
+    },
+    {
+      "fixture": "Read replay window, 32 records",
+      "medianUs": 1.59,
+      "p95Us": 1.65
+    },
+    {
+      "fixture": "Consumer read and ack",
+      "medianUs": 0.43,
+      "p95Us": 0.48
+    },
+    {
+      "fixture": "Compact keyed log, 1k records",
+      "medianUs": 156.91,
+      "p95Us": 173.22
+    },
+    {
+      "fixture": "Append batch compactOnAppend, 1k records",
+      "medianUs": 103.94,
+      "p95Us": 113.27
+    },
+    {
+      "fixture": "Replay from checkpoint, 64 records",
+      "medianUs": 25.34,
+      "p95Us": 28
+    },
+    {
+      "fixture": "State at offset, 64 patch events",
+      "medianUs": 11.94,
+      "p95Us": 12.3
+    },
+    {
+      "fixture": "Diff between offsets, 64 patch events",
+      "medianUs": 19.75,
+      "p95Us": 20.4
+    },
+    {
+      "fixture": "Replay storage append/read checkpoint",
+      "medianUs": 11.11,
+      "p95Us": 11.56
+    },
+    {
+      "fixture": "Append Frontier patch event",
+      "medianUs": 2.23,
+      "p95Us": 2.83
+    }
+  ]
+}

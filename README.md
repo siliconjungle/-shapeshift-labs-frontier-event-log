@@ -251,20 +251,20 @@ Run the package-local benchmark:
 npm run bench
 ```
 
-Latest local package benchmark on Node v26.1.0, darwin arm64, 9 rounds:
+Latest local package benchmark on Node v26.1.0, darwin arm64, 120 rounds:
 
 | Fixture | Median | p95 |
 | --- | ---: | ---: |
-| Append keyed JSON event | 3.79 us | 4.68 us |
-| Read replay window, 32 records | 1.64 us | 2.06 us |
-| Consumer read and ack | 0.44 us | 0.55 us |
-| Compact keyed log, 1k records | 181.84 us | 232.58 us |
-| Append batch compactOnAppend, 1k records | 107.28 us | 154.82 us |
-| Replay from checkpoint, 64 records | 26.63 us | 28.06 us |
-| State at offset, 64 patch events | 12.77 us | 12.95 us |
-| Diff between offsets, 64 patch events | 21.77 us | 22.49 us |
-| Replay storage append/read checkpoint | 11.19 us | 12.72 us |
-| Append Frontier patch event | 2.17 us | 2.74 us |
+| Append keyed JSON event | 3.85 us | 4.45 us |
+| Read replay window, 32 records | 1.59 us | 1.65 us |
+| Consumer read and ack | 0.43 us | 0.48 us |
+| Compact keyed log, 1k records | 156.91 us | 173.22 us |
+| Append batch compactOnAppend, 1k records | 103.94 us | 113.27 us |
+| Replay from checkpoint, 64 records | 25.34 us | 28.00 us |
+| State at offset, 64 patch events | 11.94 us | 12.30 us |
+| Diff between offsets, 64 patch events | 19.75 us | 20.40 us |
+| Replay storage append/read checkpoint | 11.11 us | 11.56 us |
+| Append Frontier patch event | 2.23 us | 2.83 us |
 
 These are Frontier-only package measurements, not competitor comparisons.
 Replay and consumer fixtures use preseeded retained logs so the timed work is read/cursor behavior, not fixture construction.
