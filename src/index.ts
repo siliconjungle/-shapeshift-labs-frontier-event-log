@@ -7,7 +7,7 @@ export {
   diffBetweenTimes,
   stateAtTime,
   replayEventLog
-} from './event-log.js';
+} from './event-log.ts';
 
 export type {
   EventLog,
@@ -43,4 +43,4 @@ export type {
   EventLogTemporalDiffResult,
   EventLogTemporalPoint,
   EventLogTemporalStateResult
-} from './event-log.js';
+} from './event-log.ts';
