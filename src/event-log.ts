@@ -221,11 +221,13 @@ export type AutonomousDecisionReplayStatus =
   | 'committed'
   | 'rejected'
   | 'rerun'
+  | 'superseded'
+  | 'conflict-blocked'
   | 'human-blocked';
 
 export type AutonomousDecisionReplayTerminalStatus = Extract<
   AutonomousDecisionReplayStatus,
-  'applied' | 'committed' | 'rejected'
+  'applied' | 'committed' | 'rejected' | 'superseded'
 >;
 
 export type AutonomousDecisionReplayClassifierResult =
@@ -243,6 +245,38 @@ export type AutonomousDecisionReplaySubjectResult = string | readonly string[] |
 export type AutonomousDecisionReplaySubjectResolver<TValue extends JsonValue = JsonValue> = (
   record: EventLogRecord<TValue>
 ) => AutonomousDecisionReplaySubjectResult;
+
+export interface AutonomousDecisionReplayRecordValue extends JsonObject {
+  kind: AutonomousDecisionReplayStatus;
+  queueSubject?: string;
+  queueSubjectAliases?: string[];
+  queueSubjects?: string[];
+  queueKey?: string;
+  queueKeys?: string[];
+  queueItemId?: string;
+  queueItemIds?: string[];
+  jobId?: string;
+  taskId?: string;
+  taskIds?: string[];
+  run?: string;
+  sourceRun?: string;
+  lane?: string;
+  changedPaths?: string[];
+  verificationSummary?: JsonValue;
+  decisionReason?: string;
+}
+
+export type AutonomousDecisionReplayRecordFields = Omit<
+  AutonomousDecisionReplayRecordValue,
+  'kind' | 'queueSubjectAliases' | 'queueSubjects' | 'queueKeys' | 'queueItemIds' | 'taskIds' | 'changedPaths'
+> & {
+  queueSubjectAliases?: readonly string[];
+  queueSubjects?: readonly string[];
+  queueKeys?: readonly string[];
+  queueItemIds?: readonly string[];
+  taskIds?: readonly string[];
+  changedPaths?: readonly string[];
+};
 
 export interface AutonomousDecisionReplayOptions<TValue extends JsonValue = JsonValue> {
   cursor?: EventLogCursor | number | null;
@@ -263,6 +297,8 @@ export interface AutonomousDecisionReplaySubjectSummary<TValue extends JsonValue
   committed: number;
   rejected: number;
   rerun: number;
+  superseded: number;
+  conflictBlocked: number;
   humanBlocked: number;
   status: AutonomousDecisionReplayStatus;
   terminalStatus: AutonomousDecisionReplayTerminalStatus | null;
@@ -277,6 +313,8 @@ export interface AutonomousDecisionReplaySummary<TValue extends JsonValue = Json
   committed: number;
   rejected: number;
   rerun: number;
+  superseded: number;
+  conflictBlocked: number;
   humanBlocked: number;
   terminalRecords: number;
   openRecords: number;
@@ -291,6 +329,52 @@ export interface AutonomousDecisionReplaySummary<TValue extends JsonValue = Json
   highWatermark: number;
   truncated: boolean;
 }
+
+export type CoordinatorGateEventStatus =
+  | 'selected'
+  | 'started'
+  | 'passed'
+  | 'failed'
+  | 'skipped';
+
+export type CoordinatorGateEventKind =
+  | 'gate.selected'
+  | 'gate.started'
+  | 'gate.passed'
+  | 'gate.failed'
+  | 'gate.skipped';
+
+export interface CoordinatorGateEventValue extends JsonObject {
+  kind: CoordinatorGateEventKind;
+  status: CoordinatorGateEventStatus;
+  gateName: string;
+  jobId?: string;
+  jobIds?: string[];
+  taskId?: string;
+  taskIds?: string[];
+  queueSubject?: string;
+  queueSubjectAliases?: string[];
+  queueSubjects?: string[];
+  queueKey?: string;
+  queueKeys?: string[];
+  queueItemId?: string;
+  queueItemIds?: string[];
+  run?: string;
+  lane?: string;
+  reason?: string;
+}
+
+export type CoordinatorGateEventFields = Omit<
+  CoordinatorGateEventValue,
+  'kind' | 'status' | 'jobIds' | 'taskIds' | 'queueSubjectAliases' | 'queueSubjects' | 'queueKeys' | 'queueItemIds'
+> & {
+  jobIds?: readonly string[];
+  taskIds?: readonly string[];
+  queueSubjectAliases?: readonly string[];
+  queueSubjects?: readonly string[];
+  queueKeys?: readonly string[];
+  queueItemIds?: readonly string[];
+};
 
 export type EventLogTemporalPoint =
   | number
@@ -843,19 +927,23 @@ export function summarizeAutonomousDecisionReplay<TValue extends JsonValue = Jso
   if (typeof resolveQueueSubject !== 'function') {
     throw new TypeError('event log autonomous decision replay summary queue subject resolver must be a function');
   }
-
-  const batchSize = options.batchSize === undefined ? 256 : Math.max(1, Math.floor(options.batchSize));
-  const maxBytes = options.maxBytesPerRead === undefined ? undefined : Math.max(0, Math.floor(options.maxBytesPerRead));
-  let cursor = readCursorOffset(options.cursor);
+  const scan = collectAutonomousDecisionReplayEntries(log, classify, resolveQueueSubject, {
+    cursor: options.cursor,
+    batchSize: options.batchSize,
+    maxBytesPerRead: options.maxBytesPerRead,
+    strict: options.strict
+  });
   const componentByAlias = new Map<string, AutonomousDecisionReplayComponent<TValue>>();
   const components = new Set<AutonomousDecisionReplayComponent<TValue>>();
   const summary: AutonomousDecisionReplaySummary<TValue> = {
-    records: 0,
-    matchedRecords: 0,
+    records: scan.records,
+    matchedRecords: scan.matchedRecords,
     applied: 0,
     committed: 0,
     rejected: 0,
     rerun: 0,
+    superseded: 0,
+    conflictBlocked: 0,
     humanBlocked: 0,
     terminalRecords: 0,
     openRecords: 0,
@@ -864,66 +952,47 @@ export function summarizeAutonomousDecisionReplay<TValue extends JsonValue = Jso
     byAlias: Object.create(null),
     latestTerminalByQueueSubject: Object.create(null),
     latestOpenByQueueSubject: Object.create(null),
-    cursor: { offset: cursor },
-    firstOffset: log.firstOffset,
-    nextOffset: log.nextOffset,
-    highWatermark: log.highWatermark,
-    truncated: false
+    cursor: scan.cursor,
+    firstOffset: scan.firstOffset,
+    nextOffset: scan.nextOffset,
+    highWatermark: scan.highWatermark,
+    truncated: scan.truncated
   };
 
-  for (;;) {
-    const readOptions: EventLogReadOptions = { limit: batchSize };
-    if (maxBytes !== undefined) readOptions.maxBytes = maxBytes;
-    const result = log.read(cursor, readOptions);
-    summary.firstOffset = result.firstOffset;
-    summary.nextOffset = result.nextOffset;
-    summary.highWatermark = result.highWatermark;
-    summary.cursor = result.cursor;
-    if (result.truncated) {
-      summary.truncated = true;
-      if (options.strict === true) {
-        throw new RangeError('event log autonomous decision replay summary was truncated before offset ' + cursor);
-      }
+  for (let i = 0; i < scan.entries.length; i++) {
+    const entry = scan.entries[i];
+    const component = upsertAutonomousDecisionReplayComponent(
+      components,
+      componentByAlias,
+      entry.record,
+      entry.status,
+      entry.queueSubjects
+    );
+    incrementAutonomousDecisionReplayStatusSummary(summary, entry.status);
+    if (isAutonomousDecisionReplayTerminalStatus(entry.status)) summary.terminalRecords++;
+    else summary.openRecords++;
+    incrementAutonomousDecisionReplayComponentStatus(component, entry.status);
+    if (compareAutonomousDecisionReplayRecords(entry.record, component.currentRecord) >= 0) {
+      component.currentRecord = entry.record;
+      component.status = entry.status;
     }
-
-    for (let i = 0; i < result.records.length; i++) {
-      summary.records++;
-      const record = result.records[i];
-      const status = classify(record);
-      if (status === null || status === undefined || status === false) continue;
-      const queueSubjects = uniqueAutonomousDecisionReplaySubjects(resolveQueueSubject(record));
-      if (queueSubjects.length === 0) continue;
-
-      summary.matchedRecords++;
-      incrementAutonomousDecisionReplayStatusSummary(summary, status);
-      if (isAutonomousDecisionReplayTerminalStatus(status)) summary.terminalRecords++;
-      else summary.openRecords++;
-      const component = upsertAutonomousDecisionReplayComponent(
-        components,
-        componentByAlias,
-        record,
-        status,
-        queueSubjects
-      );
-      incrementAutonomousDecisionReplayComponentStatus(component, status);
-      if (record.offset > component.lastOffset) component.lastOffset = record.offset;
-      if (record.offset >= component.currentRecord.offset) {
-        component.currentRecord = record;
-        component.status = status;
-      }
-      if (isAutonomousDecisionReplayTerminalStatus(status) && (component.terminalRecord === null || record.offset >= component.terminalRecord.offset)) {
-        component.terminalStatus = status;
-        component.terminalRecord = record;
-      }
+    if (
+      isAutonomousDecisionReplayTerminalStatus(entry.status)
+      && (component.terminalRecord === null || compareAutonomousDecisionReplayRecords(entry.record, component.terminalRecord) >= 0)
+    ) {
+      component.terminalStatus = entry.status;
+      component.terminalRecord = entry.record;
     }
-
-    cursor = result.cursor.offset;
-    if (result.records.length === 0 || cursor >= result.nextOffset) break;
   }
 
   const subjects = Array.from(components)
     .map((component) => materializeAutonomousDecisionReplaySubject(component))
-    .sort((left, right) => right.lastOffset - left.lastOffset || left.queueSubject.localeCompare(right.queueSubject));
+    .sort((left, right) => {
+      const byCurrent = compareAutonomousDecisionReplayRecords(right.currentRecord, left.currentRecord);
+      if (byCurrent !== 0) return byCurrent;
+      if (right.lastOffset !== left.lastOffset) return right.lastOffset - left.lastOffset;
+      return left.queueSubject.localeCompare(right.queueSubject);
+    });
 
   for (let i = 0; i < subjects.length; i++) {
     const subject = subjects[i];
@@ -932,13 +1001,59 @@ export function summarizeAutonomousDecisionReplay<TValue extends JsonValue = Jso
       summary.byAlias[subject.queueSubjectAliases[j]] = subject;
     }
     if (subject.terminalStatus !== null) summary.latestTerminalByQueueSubject[subject.queueSubject] = subject;
-    if (subject.status === 'rerun' || subject.status === 'human-blocked') {
+    if (subject.status === 'rerun' || subject.status === 'human-blocked' || subject.status === 'conflict-blocked') {
       summary.latestOpenByQueueSubject[subject.queueSubject] = subject;
     }
   }
   summary.subjects = subjects;
 
   return summary;
+}
+
+export function replayAutonomousDecisionRecords<TState, TValue extends JsonValue = JsonValue>(
+  log: EventLog<TValue>,
+  checkpoint: EventLogCheckpoint<TState>,
+  reducer: EventLogReplayReducer<TState, TValue>,
+  options: AutonomousDecisionReplayOptions<TValue> = {}
+): EventLogReplayResult<TState> {
+  if (typeof reducer !== 'function') throw new TypeError('event log autonomous decision replay reducer must be a function');
+  if (log === null || typeof log !== 'object' || typeof log.read !== 'function') {
+    throw new TypeError('event log autonomous decision replay requires an event log');
+  }
+  const classify = options.classify === undefined ? classifyAutonomousDecisionReplayRecord : options.classify;
+  if (typeof classify !== 'function') {
+    throw new TypeError('event log autonomous decision replay classifier must be a function');
+  }
+  const resolveQueueSubject = options.resolveQueueSubject === undefined
+    ? resolveAutonomousDecisionReplaySubjects
+    : options.resolveQueueSubject;
+  if (typeof resolveQueueSubject !== 'function') {
+    throw new TypeError('event log autonomous decision replay queue subject resolver must be a function');
+  }
+
+  const scan = collectAutonomousDecisionReplayEntries(log, classify, resolveQueueSubject, {
+    cursor: options.cursor,
+    batchSize: options.batchSize,
+    maxBytesPerRead: options.maxBytesPerRead,
+    strict: options.strict
+  });
+  let state = cloneStorageValue(checkpoint.snapshot);
+  for (let i = 0; i < scan.entries.length; i++) {
+    state = reducer(state, scan.entries[i].record);
+  }
+
+  return {
+    state,
+    cursor: scan.cursor,
+    checkpoint: createEventLogCheckpoint(log, state, {
+      cursor: scan.cursor.offset,
+      timestamp: checkpoint.timestamp,
+      metadata: checkpoint.metadata
+    }),
+    replayed: scan.entries.length,
+    truncated: scan.truncated,
+    highWatermark: scan.highWatermark
+  };
 }
 
 export function stateAtTime<TState, TValue extends JsonValue = JsonValue>(
@@ -1136,6 +1251,431 @@ export function appendPatchEvent(
   });
 }
 
+export function appendAutonomousDecisionAppliedEvent(
+  log: EventLog<AutonomousDecisionReplayRecordValue>,
+  value: AutonomousDecisionReplayRecordFields,
+  options: Omit<EventLogAppendInput<AutonomousDecisionReplayRecordValue>, 'value'> = {}
+): EventLogRecord<AutonomousDecisionReplayRecordValue> {
+  return appendAutonomousDecisionReplayEvent(log, 'applied', value, options);
+}
+
+export function appendAutonomousDecisionCommittedEvent(
+  log: EventLog<AutonomousDecisionReplayRecordValue>,
+  value: AutonomousDecisionReplayRecordFields,
+  options: Omit<EventLogAppendInput<AutonomousDecisionReplayRecordValue>, 'value'> = {}
+): EventLogRecord<AutonomousDecisionReplayRecordValue> {
+  return appendAutonomousDecisionReplayEvent(log, 'committed', value, options);
+}
+
+export function appendAutonomousDecisionRejectedEvent(
+  log: EventLog<AutonomousDecisionReplayRecordValue>,
+  value: AutonomousDecisionReplayRecordFields,
+  options: Omit<EventLogAppendInput<AutonomousDecisionReplayRecordValue>, 'value'> = {}
+): EventLogRecord<AutonomousDecisionReplayRecordValue> {
+  return appendAutonomousDecisionReplayEvent(log, 'rejected', value, options);
+}
+
+export function appendAutonomousDecisionRerunEvent(
+  log: EventLog<AutonomousDecisionReplayRecordValue>,
+  value: AutonomousDecisionReplayRecordFields,
+  options: Omit<EventLogAppendInput<AutonomousDecisionReplayRecordValue>, 'value'> = {}
+): EventLogRecord<AutonomousDecisionReplayRecordValue> {
+  return appendAutonomousDecisionReplayEvent(log, 'rerun', value, options);
+}
+
+export function appendAutonomousDecisionSupersededEvent(
+  log: EventLog<AutonomousDecisionReplayRecordValue>,
+  value: AutonomousDecisionReplayRecordFields,
+  options: Omit<EventLogAppendInput<AutonomousDecisionReplayRecordValue>, 'value'> = {}
+): EventLogRecord<AutonomousDecisionReplayRecordValue> {
+  return appendAutonomousDecisionReplayEvent(log, 'superseded', value, options);
+}
+
+export function appendAutonomousDecisionConflictBlockedEvent(
+  log: EventLog<AutonomousDecisionReplayRecordValue>,
+  value: AutonomousDecisionReplayRecordFields,
+  options: Omit<EventLogAppendInput<AutonomousDecisionReplayRecordValue>, 'value'> = {}
+): EventLogRecord<AutonomousDecisionReplayRecordValue> {
+  return appendAutonomousDecisionReplayEvent(log, 'conflict-blocked', value, options);
+}
+
+export function appendAutonomousDecisionHumanBlockedEvent(
+  log: EventLog<AutonomousDecisionReplayRecordValue>,
+  value: AutonomousDecisionReplayRecordFields,
+  options: Omit<EventLogAppendInput<AutonomousDecisionReplayRecordValue>, 'value'> = {}
+): EventLogRecord<AutonomousDecisionReplayRecordValue> {
+  return appendAutonomousDecisionReplayEvent(log, 'human-blocked', value, options);
+}
+
+export function appendCoordinatorGateSelectedEvent(
+  log: EventLog<CoordinatorGateEventValue>,
+  value: CoordinatorGateEventFields,
+  options: Omit<EventLogAppendInput<CoordinatorGateEventValue>, 'value'> = {}
+): EventLogRecord<CoordinatorGateEventValue> {
+  return appendCoordinatorGateEvent(log, 'gate.selected', 'selected', value, options);
+}
+
+export function appendCoordinatorGateStartedEvent(
+  log: EventLog<CoordinatorGateEventValue>,
+  value: CoordinatorGateEventFields,
+  options: Omit<EventLogAppendInput<CoordinatorGateEventValue>, 'value'> = {}
+): EventLogRecord<CoordinatorGateEventValue> {
+  return appendCoordinatorGateEvent(log, 'gate.started', 'started', value, options);
+}
+
+export function appendCoordinatorGatePassedEvent(
+  log: EventLog<CoordinatorGateEventValue>,
+  value: CoordinatorGateEventFields,
+  options: Omit<EventLogAppendInput<CoordinatorGateEventValue>, 'value'> = {}
+): EventLogRecord<CoordinatorGateEventValue> {
+  return appendCoordinatorGateEvent(log, 'gate.passed', 'passed', value, options);
+}
+
+export function appendCoordinatorGateFailedEvent(
+  log: EventLog<CoordinatorGateEventValue>,
+  value: CoordinatorGateEventFields,
+  options: Omit<EventLogAppendInput<CoordinatorGateEventValue>, 'value'> = {}
+): EventLogRecord<CoordinatorGateEventValue> {
+  return appendCoordinatorGateEvent(log, 'gate.failed', 'failed', value, options);
+}
+
+export function appendCoordinatorGateSkippedEvent(
+  log: EventLog<CoordinatorGateEventValue>,
+  value: CoordinatorGateEventFields,
+  options: Omit<EventLogAppendInput<CoordinatorGateEventValue>, 'value'> = {}
+): EventLogRecord<CoordinatorGateEventValue> {
+  return appendCoordinatorGateEvent(log, 'gate.skipped', 'skipped', value, options);
+}
+
+export type ContinuousPoolLifecycleEventKind =
+  | 'pool.started'
+  | 'worker.leased'
+  | 'worker.finished'
+  | 'bundle.collected'
+  | 'decision.written'
+  | 'patch.applied'
+  | 'queue.refilled'
+  | 'human.blocked'
+  | 'pool.drained';
+
+export interface ContinuousPoolLifecycleEventValue extends JsonObject {
+  kind: ContinuousPoolLifecycleEventKind;
+  run?: string;
+  worker?: string;
+  task?: string;
+  lane?: string;
+  decision?: string;
+  leaseScope?: string;
+  leaseScopes?: string[];
+}
+
+export type ContinuousPoolLifecycleEventFields = Omit<ContinuousPoolLifecycleEventValue, 'kind'>;
+
+export function appendContinuousPoolStartedEvent(
+  log: EventLog<ContinuousPoolLifecycleEventValue>,
+  value: ContinuousPoolLifecycleEventFields,
+  options: Omit<EventLogAppendInput<ContinuousPoolLifecycleEventValue>, 'value'> = {}
+): EventLogRecord<ContinuousPoolLifecycleEventValue> {
+  return appendContinuousPoolLifecycleEvent(log, 'pool.started', value, options);
+}
+
+export function appendContinuousPoolWorkerLeasedEvent(
+  log: EventLog<ContinuousPoolLifecycleEventValue>,
+  value: ContinuousPoolLifecycleEventFields,
+  options: Omit<EventLogAppendInput<ContinuousPoolLifecycleEventValue>, 'value'> = {}
+): EventLogRecord<ContinuousPoolLifecycleEventValue> {
+  return appendContinuousPoolLifecycleEvent(log, 'worker.leased', value, options);
+}
+
+export function appendContinuousPoolWorkerFinishedEvent(
+  log: EventLog<ContinuousPoolLifecycleEventValue>,
+  value: ContinuousPoolLifecycleEventFields,
+  options: Omit<EventLogAppendInput<ContinuousPoolLifecycleEventValue>, 'value'> = {}
+): EventLogRecord<ContinuousPoolLifecycleEventValue> {
+  return appendContinuousPoolLifecycleEvent(log, 'worker.finished', value, options);
+}
+
+export function appendContinuousPoolBundleCollectedEvent(
+  log: EventLog<ContinuousPoolLifecycleEventValue>,
+  value: ContinuousPoolLifecycleEventFields,
+  options: Omit<EventLogAppendInput<ContinuousPoolLifecycleEventValue>, 'value'> = {}
+): EventLogRecord<ContinuousPoolLifecycleEventValue> {
+  return appendContinuousPoolLifecycleEvent(log, 'bundle.collected', value, options);
+}
+
+export function appendContinuousPoolDecisionWrittenEvent(
+  log: EventLog<ContinuousPoolLifecycleEventValue>,
+  value: ContinuousPoolLifecycleEventFields,
+  options: Omit<EventLogAppendInput<ContinuousPoolLifecycleEventValue>, 'value'> = {}
+): EventLogRecord<ContinuousPoolLifecycleEventValue> {
+  return appendContinuousPoolLifecycleEvent(log, 'decision.written', value, options);
+}
+
+export function appendContinuousPoolPatchAppliedEvent(
+  log: EventLog<ContinuousPoolLifecycleEventValue>,
+  value: ContinuousPoolLifecycleEventFields,
+  options: Omit<EventLogAppendInput<ContinuousPoolLifecycleEventValue>, 'value'> = {}
+): EventLogRecord<ContinuousPoolLifecycleEventValue> {
+  return appendContinuousPoolLifecycleEvent(log, 'patch.applied', value, options);
+}
+
+export function appendContinuousPoolQueueRefilledEvent(
+  log: EventLog<ContinuousPoolLifecycleEventValue>,
+  value: ContinuousPoolLifecycleEventFields,
+  options: Omit<EventLogAppendInput<ContinuousPoolLifecycleEventValue>, 'value'> = {}
+): EventLogRecord<ContinuousPoolLifecycleEventValue> {
+  return appendContinuousPoolLifecycleEvent(log, 'queue.refilled', value, options);
+}
+
+export function appendContinuousPoolHumanBlockedEvent(
+  log: EventLog<ContinuousPoolLifecycleEventValue>,
+  value: ContinuousPoolLifecycleEventFields,
+  options: Omit<EventLogAppendInput<ContinuousPoolLifecycleEventValue>, 'value'> = {}
+): EventLogRecord<ContinuousPoolLifecycleEventValue> {
+  return appendContinuousPoolLifecycleEvent(log, 'human.blocked', value, options);
+}
+
+export function appendContinuousPoolDrainedEvent(
+  log: EventLog<ContinuousPoolLifecycleEventValue>,
+  value: ContinuousPoolLifecycleEventFields,
+  options: Omit<EventLogAppendInput<ContinuousPoolLifecycleEventValue>, 'value'> = {}
+): EventLogRecord<ContinuousPoolLifecycleEventValue> {
+  return appendContinuousPoolLifecycleEvent(log, 'pool.drained', value, options);
+}
+
+export type BundleSynthesisDecision =
+  | 'expected'
+  | 'written'
+  | 'generated'
+  | 'missing'
+  | 'no-change'
+  | 'synthesized'
+  | 'rejected';
+
+export type BundleSynthesisEventKind =
+  | 'bundle.expected'
+  | 'bundle.written'
+  | 'patch.generated'
+  | 'patch.missing'
+  | 'no-change.evidence'
+  | 'collector.synthesized'
+  | 'bundle.rejected';
+
+export interface BundleSynthesisEventValue extends JsonObject {
+  kind: BundleSynthesisEventKind;
+  decision: BundleSynthesisDecision;
+  bundleId?: string;
+  collector?: string;
+  run?: string;
+  task?: string;
+  lane?: string;
+  bundlePath?: string;
+  patchPath?: string;
+  evidencePaths?: string[];
+  changedPaths?: string[];
+  changedRegions?: string[];
+  reasons?: string[];
+}
+
+export type BundleSynthesisEventFields = Omit<
+  BundleSynthesisEventValue,
+  'kind' | 'decision' | 'evidencePaths' | 'changedPaths' | 'changedRegions' | 'reasons'
+> & {
+  evidencePaths?: readonly string[];
+  changedPaths?: readonly string[];
+  changedRegions?: readonly string[];
+  reasons?: readonly string[];
+};
+
+export function appendBundleExpectedEvent(
+  log: EventLog<BundleSynthesisEventValue>,
+  value: BundleSynthesisEventFields,
+  options: Omit<EventLogAppendInput<BundleSynthesisEventValue>, 'value'> = {}
+): EventLogRecord<BundleSynthesisEventValue> {
+  return appendBundleSynthesisEvent(log, 'bundle.expected', value, options);
+}
+
+export function appendBundleWrittenEvent(
+  log: EventLog<BundleSynthesisEventValue>,
+  value: BundleSynthesisEventFields,
+  options: Omit<EventLogAppendInput<BundleSynthesisEventValue>, 'value'> = {}
+): EventLogRecord<BundleSynthesisEventValue> {
+  return appendBundleSynthesisEvent(log, 'bundle.written', value, options);
+}
+
+export function appendPatchGeneratedEvent(
+  log: EventLog<BundleSynthesisEventValue>,
+  value: BundleSynthesisEventFields,
+  options: Omit<EventLogAppendInput<BundleSynthesisEventValue>, 'value'> = {}
+): EventLogRecord<BundleSynthesisEventValue> {
+  return appendBundleSynthesisEvent(log, 'patch.generated', value, options);
+}
+
+export function appendPatchMissingEvent(
+  log: EventLog<BundleSynthesisEventValue>,
+  value: BundleSynthesisEventFields,
+  options: Omit<EventLogAppendInput<BundleSynthesisEventValue>, 'value'> = {}
+): EventLogRecord<BundleSynthesisEventValue> {
+  return appendBundleSynthesisEvent(log, 'patch.missing', value, options);
+}
+
+export function appendNoChangeEvidenceEvent(
+  log: EventLog<BundleSynthesisEventValue>,
+  value: BundleSynthesisEventFields,
+  options: Omit<EventLogAppendInput<BundleSynthesisEventValue>, 'value'> = {}
+): EventLogRecord<BundleSynthesisEventValue> {
+  return appendBundleSynthesisEvent(log, 'no-change.evidence', value, options);
+}
+
+export function appendCollectorSynthesizedEvent(
+  log: EventLog<BundleSynthesisEventValue>,
+  value: BundleSynthesisEventFields,
+  options: Omit<EventLogAppendInput<BundleSynthesisEventValue>, 'value'> = {}
+): EventLogRecord<BundleSynthesisEventValue> {
+  return appendBundleSynthesisEvent(log, 'collector.synthesized', value, options);
+}
+
+export function appendBundleRejectedEvent(
+  log: EventLog<BundleSynthesisEventValue>,
+  value: BundleSynthesisEventFields,
+  options: Omit<EventLogAppendInput<BundleSynthesisEventValue>, 'value'> = {}
+): EventLogRecord<BundleSynthesisEventValue> {
+  return appendBundleSynthesisEvent(log, 'bundle.rejected', value, options);
+}
+
+export type SemanticChangeStreamEventKind =
+  | 'slice.claimed'
+  | 'slice.applied'
+  | 'lease.acquired'
+  | 'lease.released'
+  | 'merge.promoted'
+  | 'merge.superseded';
+
+export interface SemanticChangeStreamEventValue extends JsonObject {
+  kind: SemanticChangeStreamEventKind;
+  semanticRegionKey?: string;
+  semanticRegionKeys?: string[];
+  sourceHead?: string;
+  sourceHeads?: string[];
+  currentHead?: string;
+  currentHeads?: string[];
+  taskId?: string;
+  taskIds?: string[];
+  leaseKey?: string;
+  leaseKeys?: string[];
+  leaseId?: string;
+  sliceId?: string;
+  mergeId?: string;
+  promotionParent?: string;
+  promotionParents?: string[];
+  supersedingMergeId?: string;
+}
+
+export type SemanticChangeStreamEventFields = Omit<SemanticChangeStreamEventValue, 'kind'>;
+
+export interface SemanticChangeStreamEventFilterOptions {
+  kind?: SemanticChangeStreamEventKind | readonly SemanticChangeStreamEventKind[];
+  semanticRegionKey?: string | readonly string[];
+  leaseKey?: string | readonly string[];
+  taskId?: string | readonly string[];
+  promotionParent?: string | readonly string[];
+}
+
+export interface SemanticChangeStreamReplayOptions extends EventLogReplayOptions, SemanticChangeStreamEventFilterOptions {}
+
+export function appendSemanticSliceClaimedEvent(
+  log: EventLog<SemanticChangeStreamEventValue>,
+  value: SemanticChangeStreamEventFields,
+  options: Omit<EventLogAppendInput<SemanticChangeStreamEventValue>, 'value'> = {}
+): EventLogRecord<SemanticChangeStreamEventValue> {
+  return appendSemanticChangeStreamEvent(log, 'slice.claimed', value, options);
+}
+
+export function appendSemanticSliceAppliedEvent(
+  log: EventLog<SemanticChangeStreamEventValue>,
+  value: SemanticChangeStreamEventFields,
+  options: Omit<EventLogAppendInput<SemanticChangeStreamEventValue>, 'value'> = {}
+): EventLogRecord<SemanticChangeStreamEventValue> {
+  return appendSemanticChangeStreamEvent(log, 'slice.applied', value, options);
+}
+
+export function appendSemanticLeaseAcquiredEvent(
+  log: EventLog<SemanticChangeStreamEventValue>,
+  value: SemanticChangeStreamEventFields,
+  options: Omit<EventLogAppendInput<SemanticChangeStreamEventValue>, 'value'> = {}
+): EventLogRecord<SemanticChangeStreamEventValue> {
+  return appendSemanticChangeStreamEvent(log, 'lease.acquired', value, options);
+}
+
+export function appendSemanticLeaseReleasedEvent(
+  log: EventLog<SemanticChangeStreamEventValue>,
+  value: SemanticChangeStreamEventFields,
+  options: Omit<EventLogAppendInput<SemanticChangeStreamEventValue>, 'value'> = {}
+): EventLogRecord<SemanticChangeStreamEventValue> {
+  return appendSemanticChangeStreamEvent(log, 'lease.released', value, options);
+}
+
+export function appendSemanticMergePromotedEvent(
+  log: EventLog<SemanticChangeStreamEventValue>,
+  value: SemanticChangeStreamEventFields,
+  options: Omit<EventLogAppendInput<SemanticChangeStreamEventValue>, 'value'> = {}
+): EventLogRecord<SemanticChangeStreamEventValue> {
+  return appendSemanticChangeStreamEvent(log, 'merge.promoted', value, options);
+}
+
+export function appendSemanticMergeSupersededEvent(
+  log: EventLog<SemanticChangeStreamEventValue>,
+  value: SemanticChangeStreamEventFields,
+  options: Omit<EventLogAppendInput<SemanticChangeStreamEventValue>, 'value'> = {}
+): EventLogRecord<SemanticChangeStreamEventValue> {
+  return appendSemanticChangeStreamEvent(log, 'merge.superseded', value, options);
+}
+
+export function filterSemanticChangeStreamEvents<TValue extends SemanticChangeStreamEventValue>(
+  records: readonly EventLogRecord<TValue>[],
+  options: SemanticChangeStreamEventFilterOptions = {}
+): EventLogRecord<TValue>[] {
+  const kindFilter = normalizeSemanticChangeStreamFilter(options.kind);
+  const regionFilter = normalizeSemanticChangeStreamFilter(options.semanticRegionKey);
+  const leaseFilter = normalizeSemanticChangeStreamFilter(options.leaseKey);
+  const taskFilter = normalizeSemanticChangeStreamFilter(options.taskId);
+  const promotionParentFilter = normalizeSemanticChangeStreamFilter(options.promotionParent);
+  const filtered: EventLogRecord<TValue>[] = [];
+  for (let i = 0; i < records.length; i++) {
+    const record = records[i];
+    if (matchesSemanticChangeStreamEvent(record.value, kindFilter, regionFilter, leaseFilter, taskFilter, promotionParentFilter)) {
+      filtered.push(record);
+    }
+  }
+  return filtered;
+}
+
+export function replaySemanticChangeStreamEvents<TState, TValue extends SemanticChangeStreamEventValue = SemanticChangeStreamEventValue>(
+  log: EventLog<TValue>,
+  checkpoint: EventLogCheckpoint<TState>,
+  reducer: EventLogReplayReducer<TState, TValue>,
+  options: SemanticChangeStreamReplayOptions = {}
+): EventLogReplayResult<TState> {
+  if (typeof reducer !== 'function') throw new TypeError('event log semantic change stream replay reducer must be a function');
+  const kindFilter = normalizeSemanticChangeStreamFilter(options.kind);
+  const regionFilter = normalizeSemanticChangeStreamFilter(options.semanticRegionKey);
+  const leaseFilter = normalizeSemanticChangeStreamFilter(options.leaseKey);
+  const taskFilter = normalizeSemanticChangeStreamFilter(options.taskId);
+  const promotionParentFilter = normalizeSemanticChangeStreamFilter(options.promotionParent);
+
+  return replayEventLog(
+    log,
+    checkpoint,
+    (state, record) => {
+      if (!matchesSemanticChangeStreamEvent(record.value, kindFilter, regionFilter, leaseFilter, taskFilter, promotionParentFilter)) {
+        return state;
+      }
+      return reducer(state, record);
+    },
+    options
+  );
+}
+
 export type ModelRoutingFeedbackEventKind =
   | 'model.chosen'
   | 'model.outcome'
@@ -1222,6 +1762,176 @@ function appendModelRoutingFeedbackEvent(
     headers: options.headers,
     value: payload as ModelRoutingFeedbackEventValue
   });
+}
+
+function appendAutonomousDecisionReplayEvent(
+  log: EventLog<AutonomousDecisionReplayRecordValue>,
+  kind: AutonomousDecisionReplayStatus,
+  value: AutonomousDecisionReplayRecordFields,
+  options: Omit<EventLogAppendInput<AutonomousDecisionReplayRecordValue>, 'value'> = {}
+): EventLogRecord<AutonomousDecisionReplayRecordValue> {
+  const payload = cloneJson(value) as JsonValue;
+  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new TypeError('event log autonomous decision replay event value must be an object');
+  }
+  (payload as AutonomousDecisionReplayRecordValue).kind = kind;
+  return log.append({
+    key: options.key,
+    timestamp: options.timestamp,
+    headers: options.headers,
+    value: payload as AutonomousDecisionReplayRecordValue
+  });
+}
+
+function appendCoordinatorGateEvent(
+  log: EventLog<CoordinatorGateEventValue>,
+  kind: CoordinatorGateEventKind,
+  status: CoordinatorGateEventStatus,
+  value: CoordinatorGateEventFields,
+  options: Omit<EventLogAppendInput<CoordinatorGateEventValue>, 'value'> = {}
+): EventLogRecord<CoordinatorGateEventValue> {
+  const payload = cloneJson(value) as JsonValue;
+  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new TypeError('event log coordinator gate event value must be an object');
+  }
+  const event = payload as CoordinatorGateEventValue;
+  event.kind = kind;
+  event.status = status;
+  return log.append({
+    key: options.key,
+    timestamp: options.timestamp,
+    headers: options.headers,
+    value: event
+  });
+}
+
+function appendContinuousPoolLifecycleEvent(
+  log: EventLog<ContinuousPoolLifecycleEventValue>,
+  kind: ContinuousPoolLifecycleEventKind,
+  value: ContinuousPoolLifecycleEventFields,
+  options: Omit<EventLogAppendInput<ContinuousPoolLifecycleEventValue>, 'value'> = {}
+): EventLogRecord<ContinuousPoolLifecycleEventValue> {
+  const payload = cloneJson(value) as JsonValue;
+  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new TypeError('event log continuous pool lifecycle event value must be an object');
+  }
+  (payload as ContinuousPoolLifecycleEventValue).kind = kind;
+  return log.append({
+    key: options.key,
+    timestamp: options.timestamp,
+    headers: options.headers,
+    value: payload as ContinuousPoolLifecycleEventValue
+  });
+}
+
+function appendBundleSynthesisEvent(
+  log: EventLog<BundleSynthesisEventValue>,
+  kind: BundleSynthesisEventKind,
+  value: BundleSynthesisEventFields,
+  options: Omit<EventLogAppendInput<BundleSynthesisEventValue>, 'value'> = {}
+): EventLogRecord<BundleSynthesisEventValue> {
+  const payload = cloneJson(value) as JsonValue;
+  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new TypeError('event log bundle synthesis event value must be an object');
+  }
+  const event = payload as BundleSynthesisEventValue;
+  event.kind = kind;
+  event.decision = bundleSynthesisDecisionFromKind(kind);
+  return log.append({
+    key: options.key,
+    timestamp: options.timestamp,
+    headers: options.headers,
+    value: event
+  });
+}
+
+function appendSemanticChangeStreamEvent(
+  log: EventLog<SemanticChangeStreamEventValue>,
+  kind: SemanticChangeStreamEventKind,
+  value: SemanticChangeStreamEventFields,
+  options: Omit<EventLogAppendInput<SemanticChangeStreamEventValue>, 'value'> = {}
+): EventLogRecord<SemanticChangeStreamEventValue> {
+  const payload = cloneJson(value) as JsonValue;
+  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new TypeError('event log semantic change stream event value must be an object');
+  }
+  (payload as SemanticChangeStreamEventValue).kind = kind;
+  return log.append({
+    key: options.key,
+    timestamp: options.timestamp,
+    headers: options.headers,
+    value: payload as SemanticChangeStreamEventValue
+  });
+}
+
+function bundleSynthesisDecisionFromKind(kind: BundleSynthesisEventKind): BundleSynthesisDecision {
+  switch (kind) {
+    case 'bundle.expected':
+      return 'expected';
+    case 'bundle.written':
+      return 'written';
+    case 'patch.generated':
+      return 'generated';
+    case 'patch.missing':
+      return 'missing';
+    case 'no-change.evidence':
+      return 'no-change';
+    case 'collector.synthesized':
+      return 'synthesized';
+    case 'bundle.rejected':
+      return 'rejected';
+  }
+}
+
+function normalizeSemanticChangeStreamFilter(
+  value?: string | readonly string[] | SemanticChangeStreamEventKind | readonly SemanticChangeStreamEventKind[]
+): readonly string[] | null {
+  if (value === undefined) return null;
+  const values = Array.isArray(value) ? value : [value];
+  const out: string[] = [];
+  for (let i = 0; i < values.length; i++) {
+    const candidate = String(values[i]).trim();
+    if (candidate.length === 0 || out.includes(candidate)) continue;
+    out.push(candidate);
+  }
+  return out;
+}
+
+function matchesSemanticChangeStreamEvent(
+  value: JsonValue,
+  kindFilter: readonly string[] | null,
+  regionFilter: readonly string[] | null,
+  leaseFilter: readonly string[] | null,
+  taskFilter: readonly string[] | null,
+  promotionParentFilter: readonly string[] | null
+): boolean {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const event = value as SemanticChangeStreamEventValue;
+  if (kindFilter !== null && !kindFilter.includes(event.kind)) return false;
+  if (regionFilter !== null && !matchesSemanticChangeStreamField(event.semanticRegionKey, event.semanticRegionKeys, regionFilter)) return false;
+  if (leaseFilter !== null && !matchesSemanticChangeStreamField(event.leaseKey, event.leaseKeys, leaseFilter)) return false;
+  if (taskFilter !== null && !matchesSemanticChangeStreamField(event.taskId, event.taskIds, taskFilter)) return false;
+  if (promotionParentFilter !== null && !matchesSemanticChangeStreamField(event.promotionParent, event.promotionParents, promotionParentFilter)) return false;
+  return true;
+}
+
+function matchesSemanticChangeStreamField(
+  value: string | undefined,
+  values: readonly string[] | undefined,
+  filter: readonly string[]
+): boolean {
+  if (value !== undefined && matchesSemanticChangeStreamString(value, filter)) return true;
+  if (values === undefined) return false;
+  for (let i = 0; i < values.length; i++) {
+    if (matchesSemanticChangeStreamString(values[i], filter)) return true;
+  }
+  return false;
+}
+
+function matchesSemanticChangeStreamString(value: string, filter: readonly string[]): boolean {
+  const normalized = String(value).trim();
+  if (normalized.length === 0) return false;
+  return filter.includes(normalized);
 }
 
 function normalizeModelRoutingFeedbackFilter(
@@ -1329,6 +2039,8 @@ interface AutonomousDecisionReplayComponent<TValue extends JsonValue = JsonValue
   committed: number;
   rejected: number;
   rerun: number;
+  superseded: number;
+  conflictBlocked: number;
   humanBlocked: number;
   status: AutonomousDecisionReplayStatus;
   terminalStatus: AutonomousDecisionReplayTerminalStatus | null;
@@ -1353,6 +2065,12 @@ function incrementAutonomousDecisionReplayStatusSummary(
     case 'rerun':
       summary.rerun++;
       return;
+    case 'superseded':
+      summary.superseded++;
+      return;
+    case 'conflict-blocked':
+      summary.conflictBlocked++;
+      return;
     case 'human-blocked':
       summary.humanBlocked++;
       return;
@@ -1376,6 +2094,12 @@ function incrementAutonomousDecisionReplayComponentStatus(
     case 'rerun':
       component.rerun++;
       return;
+    case 'superseded':
+      component.superseded++;
+      return;
+    case 'conflict-blocked':
+      component.conflictBlocked++;
+      return;
     case 'human-blocked':
       component.humanBlocked++;
       return;
@@ -1385,7 +2109,7 @@ function incrementAutonomousDecisionReplayComponentStatus(
 function isAutonomousDecisionReplayTerminalStatus(
   status: AutonomousDecisionReplayStatus
 ): status is AutonomousDecisionReplayTerminalStatus {
-  return status === 'applied' || status === 'committed' || status === 'rejected';
+  return status === 'applied' || status === 'committed' || status === 'rejected' || status === 'superseded';
 }
 
 function uniqueAutonomousDecisionReplaySubjects(
@@ -1465,6 +2189,8 @@ function createAutonomousDecisionReplayComponent<TValue extends JsonValue>(
     committed: 0,
     rejected: 0,
     rerun: 0,
+    superseded: 0,
+    conflictBlocked: 0,
     humanBlocked: 0,
     status,
     terminalStatus: isAutonomousDecisionReplayTerminalStatus(status) ? status : null,
@@ -1494,16 +2220,18 @@ function mergeAutonomousDecisionReplayComponents<TValue extends JsonValue>(
   target.committed += source.committed;
   target.rejected += source.rejected;
   target.rerun += source.rerun;
+  target.superseded += source.superseded;
+  target.conflictBlocked += source.conflictBlocked;
   target.humanBlocked += source.humanBlocked;
   if (source.firstOffset < target.firstOffset) target.firstOffset = source.firstOffset;
   if (source.lastOffset > target.lastOffset) target.lastOffset = source.lastOffset;
-  if (source.currentRecord.offset > target.currentRecord.offset) {
+  if (compareAutonomousDecisionReplayRecords(source.currentRecord, target.currentRecord) > 0) {
     target.currentRecord = source.currentRecord;
     target.status = source.status;
   }
   if (
     source.terminalRecord !== null
-    && (target.terminalRecord === null || source.terminalRecord.offset > target.terminalRecord.offset)
+    && (target.terminalRecord === null || compareAutonomousDecisionReplayRecords(source.terminalRecord, target.terminalRecord) > 0)
   ) {
     target.terminalRecord = source.terminalRecord;
     target.terminalStatus = source.terminalStatus;
@@ -1530,6 +2258,8 @@ function materializeAutonomousDecisionReplaySubject<TValue extends JsonValue>(
     committed: component.committed,
     rejected: component.rejected,
     rerun: component.rerun,
+    superseded: component.superseded,
+    conflictBlocked: component.conflictBlocked,
     humanBlocked: component.humanBlocked,
     status: component.status,
     terminalStatus: component.terminalStatus,
@@ -1744,7 +2474,9 @@ function readEntrySeq(value: JsonValue): number {
 
 const AUTONOMOUS_DECISION_REPLAY_STATUS_ORDER: AutonomousDecisionReplayStatus[] = [
   'human-blocked',
+  'conflict-blocked',
   'rerun',
+  'superseded',
   'committed',
   'applied',
   'rejected'
@@ -1759,7 +2491,9 @@ const AUTONOMOUS_DECISION_REPLAY_STATUS_FIELDS = [
   'state',
   'outcome',
   'decision',
-  'result'
+  'result',
+  'reason',
+  'decisionReason'
 ];
 
 const AUTONOMOUS_DECISION_REPLAY_STATUS_PATTERNS: Array<{
@@ -1773,9 +2507,19 @@ const AUTONOMOUS_DECISION_REPLAY_STATUS_PATTERNS: Array<{
     tokens: ['human', 'blocked']
   },
   {
+    status: 'conflict-blocked',
+    normalized: ['conflictblocked', 'blockedconflict', 'conflictstalled'],
+    tokens: ['conflict', 'blocked']
+  },
+  {
     status: 'rerun',
-    normalized: ['rerun', 'rerunwork', 'retry', 'requeue', 'stale', 'staleagainsthead', 'conflictblocked'],
+    normalized: ['rerun', 'rerunwork', 'retry', 'requeue', 'stale', 'staleagainsthead'],
     tokens: ['rerun']
+  },
+  {
+    status: 'superseded',
+    normalized: ['superseded', 'supersede', 'superseding'],
+    tokens: ['superseded']
   },
   {
     status: 'committed',
@@ -1813,6 +2557,23 @@ const AUTONOMOUS_DECISION_REPLAY_SUBJECT_FIELDS = [
   'subjects'
 ] as const;
 
+interface AutonomousDecisionReplayEntry<TValue extends JsonValue = JsonValue> {
+  record: EventLogRecord<TValue>;
+  status: AutonomousDecisionReplayStatus;
+  queueSubjects: readonly string[];
+}
+
+interface AutonomousDecisionReplayScan<TValue extends JsonValue = JsonValue> {
+  entries: AutonomousDecisionReplayEntry<TValue>[];
+  records: number;
+  matchedRecords: number;
+  cursor: EventLogCursor;
+  firstOffset: number;
+  nextOffset: number;
+  highWatermark: number;
+  truncated: boolean;
+}
+
 function classifyAutonomousDecisionReplayRecord<TValue extends JsonValue>(
   record: EventLogRecord<TValue>
 ): AutonomousDecisionReplayClassifierResult {
@@ -1830,6 +2591,66 @@ function resolveAutonomousDecisionReplaySubjects<TValue extends JsonValue>(
   if (record.headers !== undefined) collectAutonomousDecisionReplaySubjects(record.headers, subjects);
   if (record.key !== undefined) subjects.add(String(record.key).trim());
   return Array.from(subjects).filter((subject) => subject.length > 0);
+}
+
+function collectAutonomousDecisionReplayEntries<TValue extends JsonValue>(
+  log: EventLog<TValue>,
+  classify: AutonomousDecisionReplayClassifier<TValue>,
+  resolveQueueSubject: AutonomousDecisionReplaySubjectResolver<TValue>,
+  options: Pick<AutonomousDecisionReplayOptions<TValue>, 'cursor' | 'batchSize' | 'maxBytesPerRead' | 'strict'>
+): AutonomousDecisionReplayScan<TValue> {
+  const batchSize = options.batchSize === undefined ? 256 : Math.max(1, Math.floor(options.batchSize));
+  const maxBytes = options.maxBytesPerRead === undefined ? undefined : Math.max(0, Math.floor(options.maxBytesPerRead));
+  let cursor = readCursorOffset(options.cursor);
+  const entries: AutonomousDecisionReplayEntry<TValue>[] = [];
+  let records = 0;
+  let matchedRecords = 0;
+  let firstOffset = log.firstOffset;
+  let nextOffset = log.nextOffset;
+  let highWatermark = log.highWatermark;
+  let truncated = false;
+
+  for (;;) {
+    const readOptions: EventLogReadOptions = { limit: batchSize };
+    if (maxBytes !== undefined) readOptions.maxBytes = maxBytes;
+    const result = log.read(cursor, readOptions);
+    firstOffset = result.firstOffset;
+    nextOffset = result.nextOffset;
+    highWatermark = result.highWatermark;
+    if (result.truncated) {
+      truncated = true;
+      if (options.strict === true) {
+        throw new RangeError('event log autonomous decision replay was truncated before offset ' + cursor);
+      }
+    }
+
+    for (let i = 0; i < result.records.length; i++) {
+      records++;
+      const record = result.records[i];
+      const status = classify(record);
+      if (status === null || status === undefined || status === false) continue;
+      const queueSubjects = uniqueAutonomousDecisionReplaySubjects(resolveQueueSubject(record));
+      if (queueSubjects.length === 0) continue;
+      matchedRecords++;
+      entries.push({ record, status, queueSubjects });
+    }
+
+    cursor = result.cursor.offset;
+    if (result.records.length === 0 || cursor >= result.nextOffset) break;
+  }
+
+  entries.sort(compareAutonomousDecisionReplayEntries);
+
+  return {
+    entries,
+    records,
+    matchedRecords,
+    cursor: { offset: cursor },
+    firstOffset,
+    nextOffset,
+    highWatermark,
+    truncated
+  };
 }
 
 function collectAutonomousDecisionReplayValue(value: JsonValue, matches: Set<AutonomousDecisionReplayStatus>): void {
@@ -1876,6 +2697,24 @@ function collectAutonomousDecisionReplayText(text: string, matches: Set<Autonomo
       matches.add(pattern.status);
     }
   }
+}
+
+function compareAutonomousDecisionReplayEntries<TValue extends JsonValue>(
+  left: AutonomousDecisionReplayEntry<TValue>,
+  right: AutonomousDecisionReplayEntry<TValue>
+): number {
+  if (left.record.timestamp !== right.record.timestamp) return left.record.timestamp - right.record.timestamp;
+  if (left.record.offset !== right.record.offset) return left.record.offset - right.record.offset;
+  return 0;
+}
+
+function compareAutonomousDecisionReplayRecords<TValue extends JsonValue>(
+  left: EventLogRecord<TValue>,
+  right: EventLogRecord<TValue>
+): number {
+  if (left.timestamp !== right.timestamp) return left.timestamp - right.timestamp;
+  if (left.offset !== right.offset) return left.offset - right.offset;
+  return 0;
 }
 
 function orderAutonomousDecisionReplayStatuses(matches: Set<AutonomousDecisionReplayStatus>): AutonomousDecisionReplayStatus | null {

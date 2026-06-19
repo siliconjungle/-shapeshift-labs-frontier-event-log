@@ -1,6 +1,6 @@
 # Frontier Event Log
 
-Bounded in-memory event logs, replay cursors, key compaction, and Frontier patch events.
+Bounded in-memory event logs, replay cursors, key compaction, question lifecycle records, semantic change streams, coordinator gate lifecycle records, bundle synthesis lifecycle records, and Frontier patch events.
 
 This package sits beside [`@shapeshift-labs/frontier`](https://www.npmjs.com/package/@shapeshift-labs/frontier), the small JSON diff/apply core package. It keeps event replay, cursor ownership, retention, and compaction out of state/cache packages while still using core JSON clone and patch types.
 
@@ -240,29 +240,90 @@ console.log(replay.records, replay.cursor);
 ```ts
 import {
   applyPatchEventRecord,
+  appendAutonomousDecisionAppliedEvent,
+  appendAutonomousDecisionCommittedEvent,
+  appendAutonomousDecisionConflictBlockedEvent,
+  appendAutonomousDecisionHumanBlockedEvent,
+  appendAutonomousDecisionNoChangeEvent,
+  appendAutonomousDecisionRejectedEvent,
+  appendAutonomousDecisionRerunEvent,
+  appendAutonomousDecisionSupersededEvent,
+  appendCoordinatorGateFailedEvent,
+  appendCoordinatorGatePassedEvent,
+  appendCoordinatorGateSelectedEvent,
+  appendCoordinatorGateSkippedEvent,
+  appendCoordinatorGateStartedEvent,
   appendPatchEvent,
+  appendBundleExpectedEvent,
+  appendBundleWrittenEvent,
+  appendPatchGeneratedEvent,
+  appendPatchMissingEvent,
+  appendNoChangeEvidenceEvent,
+  appendCollectorSynthesizedEvent,
+  appendBundleRejectedEvent,
+  appendContinuousPoolStartedEvent,
+  appendContinuousPoolWorkerScheduledEvent,
+  appendContinuousPoolWorkerStartedEvent,
+  appendContinuousPoolWorkerHeartbeatEvent,
+  appendContinuousPoolWorkerLeasedEvent,
+  appendContinuousPoolWorkerFinishedEvent,
+  appendContinuousPoolWorkerFailedEvent,
+  appendContinuousPoolWorkerDrainedEvent,
+  appendContinuousPoolBundleCollectedEvent,
+  appendContinuousPoolDecisionWrittenEvent,
+  appendContinuousPoolPatchAppliedEvent,
+  appendContinuousPoolQueueRefilledEvent,
+  appendContinuousPoolHumanBlockedEvent,
+  appendContinuousPoolDrainedEvent,
+  appendSemanticLeaseAcquiredEvent,
+  appendSemanticLeaseReleasedEvent,
+  appendSemanticMergePromotedEvent,
+  appendSemanticMergeSupersededEvent,
+  appendSemanticSliceAppliedEvent,
+  appendSemanticSliceClaimedEvent,
   appendModelChosenEvent,
   appendModelOutcomeEvent,
   appendRsiRecommendationEvent,
   appendTournamentObservationEvent,
+  replayAutonomousDecisionRecords,
   summarizeAutonomousDecisionReplay,
   createEventLogCheckpoint,
   createEventLog,
   createEventLogReplayStorage,
   diffBetweenTimes,
   filterModelRoutingFeedbackEvents,
+  filterSemanticChangeStreamEvents,
   replayEventLog,
+  replaySemanticChangeStreamEvents,
   stateAtTime,
   summarizeAgentReplay,
   type AgentReplaySummary,
   type AgentReplaySummaryClassifier,
+  type AutonomousDecisionReplayRecordFields,
+  type AutonomousDecisionReplayRecordValue,
   type AutonomousDecisionReplaySummary,
+  type CoordinatorGateEventFields,
+  type CoordinatorGateEventKind,
+  type CoordinatorGateEventStatus,
+  type CoordinatorGateEventValue,
   type EventLog,
   type EventLogCheckpoint,
   type EventLogConsumer,
   type EventLogCursor,
   type EventLogRecord,
   type EventLogReplayStorage,
+  type BundleSynthesisDecision,
+  type BundleSynthesisEventFields,
+  type BundleSynthesisEventKind,
+  type BundleSynthesisEventValue,
+  type ContinuousPoolLifecycleEventFields,
+  type ContinuousPoolLifecycleEventKind,
+  type ContinuousPoolLifecycleEventValue,
+  type SemanticChangeStreamEventFields,
+  type SemanticChangeStreamEventFilterOptions,
+  type SemanticChangeStreamEventKind,
+  type SemanticChangeStreamEventValue,
+  type SemanticChangeStreamReplayOptions,
   type PatchEventLogValue
 } from '@shapeshift-labs/frontier-event-log';
 ```
@@ -325,18 +386,288 @@ console.log(summary.question, summary.decision, summary.applied);
 
 The summary also includes `records`, `matchedRecords`, `cursor`, `firstOffset`, `nextOffset`, `highWatermark`, and `truncated` so dashboards can show whether retained history was complete. Pass `strict: true` to fail on truncation, or pass `classify(record)` when a run uses a different event schema.
 
+### Question Lifecycle Replay
+
+```ts
+const log = createEventLog();
+
+appendQuestionAskedEvent(log, {
+  questionCode: 'question:alpha',
+  taskId: 'task:alpha',
+  jobId: 'job:alpha'
+});
+
+appendQuestionAnsweredEvent(log, {
+  questionCode: 'question:alpha',
+  taskId: 'task:alpha',
+  jobId: 'job:alpha',
+  answerText: 'use the parent continuation',
+  continuationTarget: 'continue:parent'
+});
+
+appendQuestionConsumedEvent(log, {
+  questionCode: 'question:alpha',
+  taskId: 'task:alpha',
+  jobId: 'job:alpha',
+  answerText: 'use the parent continuation',
+  continuationTarget: 'continue:parent'
+});
+
+const questionSummary = summarizeQuestionLifecycleReplay(log);
+
+console.log(questionSummary.questionCount);
+console.log(questionSummary.byQuestionId['question:alpha']?.status);
+console.log(questionSummary.answeredQuestions.length);
+```
+
+`appendQuestionAskedEvent()` is a convenience alias for `appendQuestionOpenedEvent()`, and the append helpers write `question.opened`, `question.answered`, and `question.consumed` records with stable `questionId`/`eventId` defaults when you omit them. `summarizeQuestionLifecycleReplay()` groups those events by question identity, preserves aliases such as `questionCode`, `taskId`, and `jobId`, and separates `openedQuestions`, `answeredQuestions`, and `consumedQuestions` so dashboards and continuation routing can render the current lifecycle without a second projection layer.
+
 ### Autonomous Decision Replay
 
 ```ts
+const log = createEventLog();
+
+appendAutonomousDecisionAppliedEvent(log, {
+  queueSubject: 'queue:alpha',
+  queueSubjectAliases: ['job:alpha'],
+  changedPaths: ['packages/frontier-event-log/src/event-log.ts'],
+  verificationSummary: { passed: true, checks: 12 },
+  sourceRun: 'run:source-1',
+  decisionReason: 'tests passed'
+}, { timestamp: 10 });
+
+appendAutonomousDecisionConflictBlockedEvent(log, {
+  queueSubject: 'queue:beta',
+  changedPaths: ['packages/frontier-event-log/src/index.ts'],
+  verificationSummary: { passed: false, blocked: 'merge conflict' },
+  sourceRun: 'run:source-2',
+  decisionReason: 'conflict must be resolved first'
+}, { timestamp: 20 });
+
 const replay = summarizeAutonomousDecisionReplay(log);
 
 console.log(replay.byQueueSubject['queue:alpha']?.terminalStatus);
 console.log(replay.latestOpenByQueueSubject['queue:beta']?.status);
+
+const ordered = replayAutonomousDecisionRecords(
+  log,
+  createEventLogCheckpoint(log, [], { cursor: 0 }),
+  (state, record) => state.concat(record.value.kind)
+);
+
+console.log(ordered.state);
 ```
+
+`appendAutonomousDecisionAppliedEvent()`, `appendAutonomousDecisionCommittedEvent()`, `appendAutonomousDecisionRejectedEvent()`, `appendAutonomousDecisionRerunEvent()`, `appendAutonomousDecisionNoChangeEvent()`, `appendAutonomousDecisionSupersededEvent()`, `appendAutonomousDecisionConflictBlockedEvent()`, and `appendAutonomousDecisionHumanBlockedEvent()` write a shared replay schema for autonomous decisions. Each emitted record gets a stable `value.id` by default, and you can still supply `options.key` when a keyed record is useful. Each record can carry `queueSubject` and aliases for dashboard grouping plus `changedPaths`, `verificationSummary`, `sourceRun`, and `decisionReason`.
 
 `summarizeAutonomousDecisionReplay()` collapses decision records by queue subject aliases and keeps the latest collapsed state for each subject. The default resolver looks for common subject fields such as `queueSubject`, `queueSubjectAlias`, `queueSubjectAliases`, `queueSubjects`, `queueKeys`, `queueItemIds`, `jobId`, `taskId`, `key`, and `alias`, then merges any overlapping aliases into one subject summary.
 
-Terminal `applied`, `committed`, and `rejected` records remain in `latestTerminalByQueueSubject`, while `rerun` and `human-blocked` records stay visible in `latestOpenByQueueSubject` until a terminal record supersedes them. The returned summary also exposes `byAlias` for direct alias lookup.
+Terminal `applied`, `committed`, `rejected`, and `superseded` records remain in `latestTerminalByQueueSubject`, while `rerun`, `conflict-blocked`, and `human-blocked` records stay visible in `latestOpenByQueueSubject` until a terminal record supersedes them. `replayAutonomousDecisionRecords()` replays the matching records in timestamp order before applying the reducer. The returned summary also exposes `byAlias` for direct alias lookup.
+
+### Coordinator Gate Lifecycle
+
+```ts
+const log = createEventLog();
+
+appendCoordinatorGateSelectedEvent(log, {
+  gateName: 'coordinator-root-test',
+  jobId: 'job:alpha',
+  taskId: 'task:alpha',
+  queueSubject: 'queue:alpha',
+  queueSubjectAliases: ['job:alpha', 'queue:alpha', 'task:alpha'],
+  queueKey: 'queue:alpha',
+  run: 'run:auto-drain',
+  lane: 'lane:coordinator'
+});
+
+appendCoordinatorGateStartedEvent(log, {
+  gateName: 'coordinator-root-test',
+  jobId: 'job:alpha',
+  taskId: 'task:alpha',
+  queueSubject: 'queue:alpha',
+  queueSubjectAliases: ['job:alpha', 'queue:alpha', 'task:alpha'],
+  queueKey: 'queue:alpha',
+  run: 'run:auto-drain',
+  lane: 'lane:coordinator'
+});
+
+appendCoordinatorGatePassedEvent(log, {
+  gateName: 'coordinator-root-test',
+  jobId: 'job:alpha',
+  taskId: 'task:alpha',
+  queueSubject: 'queue:alpha',
+  queueSubjectAliases: ['job:alpha', 'queue:alpha', 'task:alpha'],
+  queueKey: 'queue:alpha',
+  run: 'run:auto-drain',
+  lane: 'lane:coordinator'
+});
+
+appendCoordinatorGateFailedEvent(log, {
+  gateName: 'coordinator-package-test',
+  jobId: 'job:beta',
+  taskId: 'task:beta',
+  queueSubject: 'queue:beta',
+  queueSubjectAliases: ['job:beta', 'queue:beta', 'task:beta'],
+  queueKey: 'queue:beta',
+  run: 'run:auto-drain',
+  lane: 'lane:coordinator',
+  reason: 'exit code 1'
+});
+
+appendCoordinatorGateSkippedEvent(log, {
+  gateName: 'coordinator-package-lint',
+  jobId: 'job:gamma',
+  taskId: 'task:gamma',
+  queueSubject: 'queue:gamma',
+  queueSubjectAliases: ['job:gamma', 'queue:gamma', 'task:gamma'],
+  queueKey: 'queue:gamma',
+  run: 'run:auto-drain',
+  lane: 'lane:coordinator',
+  reason: 'gate already satisfied'
+});
+```
+
+The coordinator gate helpers write compact replayable records for `selected`, `started`, `passed`, `failed`, and `skipped` lifecycle steps. Each record carries `kind`, `status`, `gateName`, and optional job/task/queue aliases (`jobId`, `taskId`, `queueSubject`, `queueSubjectAliases`, `queueKey`, `queueItemId`) so default auto-drain can explain why a gate moved forward or stopped without replaying raw terminal logs.
+
+### Continuous Pool Lifecycle
+
+```ts
+const log = createEventLog();
+
+appendContinuousPoolStartedEvent(log, {
+  run: 'run:pool-1',
+  lane: 'lane:continuous',
+  task: 'task:pool-1'
+});
+
+appendContinuousPoolWorkerLeasedEvent(log, {
+  run: 'run:pool-1',
+  worker: 'worker:1',
+  task: 'task:pool-1',
+  lane: 'lane:continuous',
+  leaseScope: 'lease:scope:a'
+});
+
+appendContinuousPoolWorkerHeartbeatEvent(log, {
+  run: 'run:pool-1',
+  worker: 'worker:1',
+  task: 'task:pool-1',
+  lane: 'lane:continuous',
+  decision: 'worker:alive',
+  leaseScopes: ['lease:scope:a', 'lease:scope:b']
+});
+
+appendContinuousPoolHumanBlockedEvent(log, {
+  run: 'run:pool-1',
+  worker: 'worker:1',
+  task: 'task:block-1',
+  lane: 'lane:continuous',
+  decision: 'decision:human-blocked'
+});
+
+const kinds = replayEventLog(
+  log,
+  createEventLogCheckpoint(log, [], { cursor: 0 }),
+  (state, record) => {
+    state.push(record.value.kind);
+    return state;
+  }
+  ).state;
+```
+
+The continuous pool lifecycle helpers write compact records for long-running swarm pools: `pool.started`, `worker.scheduled`, `worker.started`, `worker.heartbeat`, `worker.leased`, `worker.finished`, `worker.failed`, `worker.drained`, `bundle.collected`, `decision.written`, `patch.applied`, `queue.refilled`, `human.blocked`, and `pool.drained`. Each record keeps the same replay-friendly core fields: `run`, `worker`, `task`, `lane`, `decision`, and optional `leaseScope`/`leaseScopes`.
+
+### Bundle Synthesis Lifecycle
+
+```ts
+appendBundleExpectedEvent(log, {
+  bundleId: 'bundle:1',
+  run: 'run:bundle-1',
+  task: 'task:bundle-1',
+  lane: 'lane:bundle-events'
+});
+
+appendPatchGeneratedEvent(log, {
+  bundleId: 'bundle:1',
+  run: 'run:bundle-1',
+  task: 'task:bundle-1',
+  lane: 'lane:bundle-events',
+  patchPath: 'agent-runs/bundle-1/changes.patch',
+  changedPaths: ['packages/frontier-event-log/src/event-log.ts']
+});
+
+appendNoChangeEvidenceEvent(log, {
+  bundleId: 'bundle:2',
+  run: 'run:bundle-2',
+  task: 'task:bundle-2',
+  lane: 'lane:bundle-events',
+  evidencePaths: ['agent-runs/bundle-2/evidence.json']
+});
+```
+
+The bundle synthesis helpers write compact records with a shared `decision` vocabulary: `expected`, `written`, `generated`, `missing`, `no-change`, `synthesized`, and `rejected`. Use `bundleId` as the subject key and keep optional artifact paths in `bundlePath`, `patchPath`, and `evidencePaths` when you need them.
+
+### Semantic Change Streams
+
+```ts
+const log = createEventLog();
+
+appendSemanticSliceClaimedEvent(log, {
+  semanticRegionKey: 'region:src/apply.ts#apply',
+  sourceHead: 'head-a',
+  currentHead: 'head-b',
+  taskId: 'task:semantic-merge',
+  leaseKey: 'lease:src/apply.ts#apply'
+});
+
+appendSemanticLeaseAcquiredEvent(log, {
+  semanticRegionKey: 'region:src/apply.ts#apply',
+  sourceHead: 'head-a',
+  currentHead: 'head-b',
+  taskId: 'task:semantic-merge',
+  leaseKey: 'lease:src/apply.ts#apply',
+  leaseId: 'lease-1'
+});
+
+appendSemanticMergePromotedEvent(log, {
+  semanticRegionKey: 'region:src/apply.ts#apply',
+  sourceHead: 'head-a',
+  currentHead: 'head-parent',
+  taskId: 'task:semantic-merge',
+  promotionParent: 'lane:root',
+  mergeId: 'merge-1'
+});
+
+appendSemanticMergeSupersededEvent(log, {
+  semanticRegionKey: 'region:src/apply.ts#apply',
+  sourceHead: 'head-a',
+  currentHead: 'head-parent',
+  taskId: 'task:semantic-merge',
+  promotionParent: 'lane:root',
+  mergeId: 'merge-2',
+  supersedingMergeId: 'merge-3'
+});
+
+const records = log.read(0).records;
+const regionRecords = filterSemanticChangeStreamEvents(records, {
+  semanticRegionKey: 'region:src/apply.ts#apply'
+});
+const promotedRecords = filterSemanticChangeStreamEvents(records, {
+  promotionParent: 'lane:root'
+});
+
+const replay = replaySemanticChangeStreamEvents(
+  log,
+  createEventLogCheckpoint(log, [], { cursor: 0 }),
+  (state, record) => {
+    state.push(record.value.kind);
+    return state;
+  },
+  { leaseKey: 'lease:src/apply.ts#apply' }
+);
+```
+
+The semantic stream helpers append ordinary event-log records for `slice.claimed`, `slice.applied`, `lease.acquired`, `lease.released`, `merge.promoted`, and `merge.superseded` with `kind`, `semanticRegionKey`, `sourceHead`, `currentHead`, `taskId`, and lease/promotion identity fields so autonomous merge flow can replay or filter without importing swarm runtime packages. Use `filterSemanticChangeStreamEvents()` to keep only records for a region, lease, task, or promotion parent before replaying them into a dashboard or report. Use `replaySemanticChangeStreamEvents()` when you want a reducer to see only the matching slice of the log.
 
 ### Model Routing Feedback Events
 
@@ -417,12 +748,14 @@ This package owns:
 - in-memory event logs,
 - snapshot checkpoints and bounded replay helpers,
 - agent/swarm replay summaries for coordinator dashboards,
+- bundle lifecycle and synthesis event records,
 - temporal state-at-time and diff-between-times helpers,
 - generic replay storage for snapshot plus change-log adapters,
 - append batching and bounded replay windows,
 - consumer cursors and acknowledgements,
 - capacity retention policies,
 - keyed compaction and tombstone dropping,
+- semantic change stream event helpers,
 - model routing feedback event helpers,
 - Frontier patch event records.
 
@@ -448,7 +781,7 @@ npm run bench
 npm run pack:dry
 ```
 
-The package test suite covers root and subpath imports, append/read behavior, clone isolation, retention policies, keyed compaction, batch limits, consumers, checkpoint replay, agent/swarm replay summaries, temporal state/diff, replay storage, patch events, and randomized operation sequences.
+The package test suite covers root and subpath imports, append/read behavior, clone isolation, retention policies, keyed compaction, batch limits, consumers, checkpoint replay, agent/swarm replay summaries, bundle lifecycle records, temporal state/diff, replay storage, patch events, and randomized operation sequences.
 
 ## Benchmarks
 
