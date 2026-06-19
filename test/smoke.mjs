@@ -9,7 +9,8 @@ import {
   diffBetweenTimes,
   stateAtTime,
   replayEventLog,
-  summarizeAgentReplay
+  summarizeAgentReplay,
+  summarizeAutonomousDecisionReplay
 } from '../dist/index.js';
 import { createEventLog as createEventLogSubpath } from '../dist/event-log.js';
 
@@ -190,6 +191,55 @@ assert.strictEqual(createEventLogSubpath, createEventLog);
   assert.strictEqual(custom.decision, 1);
   assert.strictEqual(custom.applied, 1);
   assert.strictEqual(custom.matchedRecords, 1);
+}
+
+{
+  const log = createEventLog();
+  log.append({
+    value: {
+      type: 'autonomous-decision',
+      status: 'rerun',
+      queueSubject: 'queue:alpha',
+      queueSubjectAliases: ['job:alpha', 'task:alpha'],
+      reason: 'rerun against head'
+    }
+  });
+  log.append({
+    value: {
+      kind: 'autonomous-decision',
+      event: 'committed',
+      jobId: 'job:alpha',
+      queueKeys: ['queue:alpha', 'task:alpha'],
+      reason: 'applied after rerun'
+    }
+  });
+  log.append({
+    value: {
+      type: 'autonomous-decision',
+      status: 'human-blocked',
+      queueSubject: 'queue:beta',
+      queueSubjectAliases: ['job:beta'],
+      reason: 'needs human answer'
+    }
+  });
+
+  const summary = summarizeAutonomousDecisionReplay(log);
+  assert.strictEqual(summary.records, 3);
+  assert.strictEqual(summary.matchedRecords, 3);
+  assert.strictEqual(summary.rerun, 1);
+  assert.strictEqual(summary.committed, 1);
+  assert.strictEqual(summary.humanBlocked, 1);
+  assert.strictEqual(summary.terminalRecords, 1);
+  assert.strictEqual(summary.openRecords, 2);
+  assert.strictEqual(summary.subjects.length, 2);
+  assert.strictEqual(summary.byAlias['job:alpha'], summary.byQueueSubject['queue:alpha']);
+  assert.strictEqual(summary.byAlias['task:alpha'], summary.byQueueSubject['queue:alpha']);
+  assert.deepStrictEqual(summary.byQueueSubject['queue:alpha'].queueSubjectAliases, ['job:alpha', 'queue:alpha', 'task:alpha']);
+  assert.strictEqual(summary.byQueueSubject['queue:alpha'].status, 'committed');
+  assert.strictEqual(summary.byQueueSubject['queue:alpha'].terminalStatus, 'committed');
+  assert.strictEqual(summary.latestTerminalByQueueSubject['queue:alpha'], summary.byQueueSubject['queue:alpha']);
+  assert.strictEqual(summary.latestOpenByQueueSubject['queue:beta'].status, 'human-blocked');
+  assert.strictEqual(summary.latestOpenByQueueSubject['queue:beta'].terminalStatus, null);
 }
 
 {

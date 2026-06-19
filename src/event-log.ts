@@ -216,6 +216,82 @@ export interface AgentReplaySummary {
   truncated: boolean;
 }
 
+export type AutonomousDecisionReplayStatus =
+  | 'applied'
+  | 'committed'
+  | 'rejected'
+  | 'rerun'
+  | 'human-blocked';
+
+export type AutonomousDecisionReplayTerminalStatus = Extract<
+  AutonomousDecisionReplayStatus,
+  'applied' | 'committed' | 'rejected'
+>;
+
+export type AutonomousDecisionReplayClassifierResult =
+  | AutonomousDecisionReplayStatus
+  | null
+  | undefined
+  | false;
+
+export type AutonomousDecisionReplayClassifier<TValue extends JsonValue = JsonValue> = (
+  record: EventLogRecord<TValue>
+) => AutonomousDecisionReplayClassifierResult;
+
+export type AutonomousDecisionReplaySubjectResult = string | readonly string[] | null | undefined | false;
+
+export type AutonomousDecisionReplaySubjectResolver<TValue extends JsonValue = JsonValue> = (
+  record: EventLogRecord<TValue>
+) => AutonomousDecisionReplaySubjectResult;
+
+export interface AutonomousDecisionReplayOptions<TValue extends JsonValue = JsonValue> {
+  cursor?: EventLogCursor | number | null;
+  batchSize?: number;
+  maxBytesPerRead?: number;
+  strict?: boolean;
+  classify?: AutonomousDecisionReplayClassifier<TValue>;
+  resolveQueueSubject?: AutonomousDecisionReplaySubjectResolver<TValue>;
+}
+
+export interface AutonomousDecisionReplaySubjectSummary<TValue extends JsonValue = JsonValue> {
+  queueSubject: string;
+  queueSubjectAliases: string[];
+  records: number;
+  firstOffset: number;
+  lastOffset: number;
+  applied: number;
+  committed: number;
+  rejected: number;
+  rerun: number;
+  humanBlocked: number;
+  status: AutonomousDecisionReplayStatus;
+  terminalStatus: AutonomousDecisionReplayTerminalStatus | null;
+  currentRecord: EventLogRecord<TValue>;
+  terminalRecord: EventLogRecord<TValue> | null;
+}
+
+export interface AutonomousDecisionReplaySummary<TValue extends JsonValue = JsonValue> {
+  records: number;
+  matchedRecords: number;
+  applied: number;
+  committed: number;
+  rejected: number;
+  rerun: number;
+  humanBlocked: number;
+  terminalRecords: number;
+  openRecords: number;
+  subjects: AutonomousDecisionReplaySubjectSummary<TValue>[];
+  byQueueSubject: Record<string, AutonomousDecisionReplaySubjectSummary<TValue>>;
+  byAlias: Record<string, AutonomousDecisionReplaySubjectSummary<TValue>>;
+  latestTerminalByQueueSubject: Record<string, AutonomousDecisionReplaySubjectSummary<TValue>>;
+  latestOpenByQueueSubject: Record<string, AutonomousDecisionReplaySubjectSummary<TValue>>;
+  cursor: EventLogCursor;
+  firstOffset: number;
+  nextOffset: number;
+  highWatermark: number;
+  truncated: boolean;
+}
+
 export type EventLogTemporalPoint =
   | number
   | EventLogCursor
@@ -750,6 +826,121 @@ export function summarizeAgentReplay<TValue extends JsonValue = JsonValue>(
   return summary;
 }
 
+export function summarizeAutonomousDecisionReplay<TValue extends JsonValue = JsonValue>(
+  log: EventLog<TValue>,
+  options: AutonomousDecisionReplayOptions<TValue> = {}
+): AutonomousDecisionReplaySummary<TValue> {
+  if (log === null || typeof log !== 'object' || typeof log.read !== 'function') {
+    throw new TypeError('event log autonomous decision replay summary requires an event log');
+  }
+  const classify = options.classify === undefined ? classifyAutonomousDecisionReplayRecord : options.classify;
+  if (typeof classify !== 'function') {
+    throw new TypeError('event log autonomous decision replay summary classifier must be a function');
+  }
+  const resolveQueueSubject = options.resolveQueueSubject === undefined
+    ? resolveAutonomousDecisionReplaySubjects
+    : options.resolveQueueSubject;
+  if (typeof resolveQueueSubject !== 'function') {
+    throw new TypeError('event log autonomous decision replay summary queue subject resolver must be a function');
+  }
+
+  const batchSize = options.batchSize === undefined ? 256 : Math.max(1, Math.floor(options.batchSize));
+  const maxBytes = options.maxBytesPerRead === undefined ? undefined : Math.max(0, Math.floor(options.maxBytesPerRead));
+  let cursor = readCursorOffset(options.cursor);
+  const componentByAlias = new Map<string, AutonomousDecisionReplayComponent<TValue>>();
+  const components = new Set<AutonomousDecisionReplayComponent<TValue>>();
+  const summary: AutonomousDecisionReplaySummary<TValue> = {
+    records: 0,
+    matchedRecords: 0,
+    applied: 0,
+    committed: 0,
+    rejected: 0,
+    rerun: 0,
+    humanBlocked: 0,
+    terminalRecords: 0,
+    openRecords: 0,
+    subjects: [],
+    byQueueSubject: Object.create(null),
+    byAlias: Object.create(null),
+    latestTerminalByQueueSubject: Object.create(null),
+    latestOpenByQueueSubject: Object.create(null),
+    cursor: { offset: cursor },
+    firstOffset: log.firstOffset,
+    nextOffset: log.nextOffset,
+    highWatermark: log.highWatermark,
+    truncated: false
+  };
+
+  for (;;) {
+    const readOptions: EventLogReadOptions = { limit: batchSize };
+    if (maxBytes !== undefined) readOptions.maxBytes = maxBytes;
+    const result = log.read(cursor, readOptions);
+    summary.firstOffset = result.firstOffset;
+    summary.nextOffset = result.nextOffset;
+    summary.highWatermark = result.highWatermark;
+    summary.cursor = result.cursor;
+    if (result.truncated) {
+      summary.truncated = true;
+      if (options.strict === true) {
+        throw new RangeError('event log autonomous decision replay summary was truncated before offset ' + cursor);
+      }
+    }
+
+    for (let i = 0; i < result.records.length; i++) {
+      summary.records++;
+      const record = result.records[i];
+      const status = classify(record);
+      if (status === null || status === undefined || status === false) continue;
+      const queueSubjects = uniqueAutonomousDecisionReplaySubjects(resolveQueueSubject(record));
+      if (queueSubjects.length === 0) continue;
+
+      summary.matchedRecords++;
+      incrementAutonomousDecisionReplayStatusSummary(summary, status);
+      if (isAutonomousDecisionReplayTerminalStatus(status)) summary.terminalRecords++;
+      else summary.openRecords++;
+      const component = upsertAutonomousDecisionReplayComponent(
+        components,
+        componentByAlias,
+        record,
+        status,
+        queueSubjects
+      );
+      incrementAutonomousDecisionReplayComponentStatus(component, status);
+      if (record.offset > component.lastOffset) component.lastOffset = record.offset;
+      if (record.offset >= component.currentRecord.offset) {
+        component.currentRecord = record;
+        component.status = status;
+      }
+      if (isAutonomousDecisionReplayTerminalStatus(status) && (component.terminalRecord === null || record.offset >= component.terminalRecord.offset)) {
+        component.terminalStatus = status;
+        component.terminalRecord = record;
+      }
+    }
+
+    cursor = result.cursor.offset;
+    if (result.records.length === 0 || cursor >= result.nextOffset) break;
+  }
+
+  const subjects = Array.from(components)
+    .map((component) => materializeAutonomousDecisionReplaySubject(component))
+    .sort((left, right) => right.lastOffset - left.lastOffset || left.queueSubject.localeCompare(right.queueSubject));
+
+  for (let i = 0; i < subjects.length; i++) {
+    const subject = subjects[i];
+    summary.byQueueSubject[subject.queueSubject] = subject;
+    for (let j = 0; j < subject.queueSubjectAliases.length; j++) {
+      summary.byAlias[subject.queueSubjectAliases[j]] = subject;
+    }
+    if (subject.terminalStatus !== null) summary.latestTerminalByQueueSubject[subject.queueSubject] = subject;
+    if (subject.status === 'rerun' || subject.status === 'human-blocked') {
+      summary.latestOpenByQueueSubject[subject.queueSubject] = subject;
+    }
+  }
+  summary.subjects = subjects;
+
+  return summary;
+}
+
 export function stateAtTime<TState, TValue extends JsonValue = JsonValue>(
   log: EventLog<TValue>,
   checkpoint: EventLogCheckpoint<TState>,
@@ -1005,6 +1196,225 @@ function cloneRecord<T extends JsonValue>(record: EventLogRecord<T>): EventLogRe
   return out;
 }
 
+interface AutonomousDecisionReplayComponent<TValue extends JsonValue = JsonValue> {
+  queueSubject: string;
+  aliases: Set<string>;
+  records: number;
+  firstOffset: number;
+  lastOffset: number;
+  applied: number;
+  committed: number;
+  rejected: number;
+  rerun: number;
+  humanBlocked: number;
+  status: AutonomousDecisionReplayStatus;
+  terminalStatus: AutonomousDecisionReplayTerminalStatus | null;
+  currentRecord: EventLogRecord<TValue>;
+  terminalRecord: EventLogRecord<TValue> | null;
+}
+
+function incrementAutonomousDecisionReplayStatusSummary(
+  summary: AutonomousDecisionReplaySummary<JsonValue>,
+  status: AutonomousDecisionReplayStatus
+): void {
+  switch (status) {
+    case 'applied':
+      summary.applied++;
+      return;
+    case 'committed':
+      summary.committed++;
+      return;
+    case 'rejected':
+      summary.rejected++;
+      return;
+    case 'rerun':
+      summary.rerun++;
+      return;
+    case 'human-blocked':
+      summary.humanBlocked++;
+      return;
+  }
+}
+
+function incrementAutonomousDecisionReplayComponentStatus(
+  component: AutonomousDecisionReplayComponent<JsonValue>,
+  status: AutonomousDecisionReplayStatus
+): void {
+  switch (status) {
+    case 'applied':
+      component.applied++;
+      return;
+    case 'committed':
+      component.committed++;
+      return;
+    case 'rejected':
+      component.rejected++;
+      return;
+    case 'rerun':
+      component.rerun++;
+      return;
+    case 'human-blocked':
+      component.humanBlocked++;
+      return;
+  }
+}
+
+function isAutonomousDecisionReplayTerminalStatus(
+  status: AutonomousDecisionReplayStatus
+): status is AutonomousDecisionReplayTerminalStatus {
+  return status === 'applied' || status === 'committed' || status === 'rejected';
+}
+
+function uniqueAutonomousDecisionReplaySubjects(
+  input: AutonomousDecisionReplaySubjectResult
+): string[] {
+  const out: string[] = [];
+  if (input === null || input === undefined || input === false) return out;
+  const values = Array.isArray(input) ? input : [input];
+  for (let i = 0; i < values.length; i++) {
+    const candidate = String(values[i]).trim();
+    if (candidate.length === 0 || out.includes(candidate)) continue;
+    out[out.length] = candidate;
+  }
+  return out;
+}
+
+function upsertAutonomousDecisionReplayComponent<TValue extends JsonValue>(
+  components: Set<AutonomousDecisionReplayComponent<TValue>>,
+  componentByAlias: Map<string, AutonomousDecisionReplayComponent<TValue>>,
+  record: EventLogRecord<TValue>,
+  status: AutonomousDecisionReplayStatus,
+  queueSubjects: readonly string[]
+): AutonomousDecisionReplayComponent<TValue> {
+  const matches: AutonomousDecisionReplayComponent<TValue>[] = [];
+  for (let i = 0; i < queueSubjects.length; i++) {
+    const match = componentByAlias.get(queueSubjects[i]);
+    if (match !== undefined && !matches.includes(match)) matches.push(match);
+  }
+
+  let component = matches[0];
+  for (let i = 1; i < matches.length; i++) {
+    if (compareAutonomousDecisionReplayComponents(matches[i], component) < 0) component = matches[i];
+  }
+  if (component === undefined) {
+    component = createAutonomousDecisionReplayComponent(record, status, queueSubjects);
+    components.add(component);
+    for (let i = 0; i < queueSubjects.length; i++) {
+      componentByAlias.set(queueSubjects[i], component);
+    }
+    return component;
+  }
+
+  for (let i = 1; i < matches.length; i++) {
+    component = mergeAutonomousDecisionReplayComponents(component, matches[i], componentByAlias, components);
+  }
+
+  for (let i = 0; i < queueSubjects.length; i++) {
+    component.aliases.add(queueSubjects[i]);
+    componentByAlias.set(queueSubjects[i], component);
+  }
+
+  return component;
+}
+
+function compareAutonomousDecisionReplayComponents<TValue extends JsonValue>(
+  left: AutonomousDecisionReplayComponent<TValue>,
+  right: AutonomousDecisionReplayComponent<TValue>
+): number {
+  if (left.firstOffset !== right.firstOffset) return left.firstOffset - right.firstOffset;
+  return left.queueSubject.localeCompare(right.queueSubject);
+}
+
+function createAutonomousDecisionReplayComponent<TValue extends JsonValue>(
+  record: EventLogRecord<TValue>,
+  status: AutonomousDecisionReplayStatus,
+  queueSubjects: readonly string[]
+): AutonomousDecisionReplayComponent<TValue> {
+  const aliases = new Set<string>();
+  for (let i = 0; i < queueSubjects.length; i++) aliases.add(queueSubjects[i]);
+  return {
+    queueSubject: queueSubjects[0],
+    aliases,
+    records: 0,
+    firstOffset: record.offset,
+    lastOffset: record.offset,
+    applied: 0,
+    committed: 0,
+    rejected: 0,
+    rerun: 0,
+    humanBlocked: 0,
+    status,
+    terminalStatus: isAutonomousDecisionReplayTerminalStatus(status) ? status : null,
+    currentRecord: record,
+    terminalRecord: isAutonomousDecisionReplayTerminalStatus(status) ? record : null
+  };
+}
+
+function mergeAutonomousDecisionReplayComponents<TValue extends JsonValue>(
+  target: AutonomousDecisionReplayComponent<TValue>,
+  source: AutonomousDecisionReplayComponent<TValue>,
+  componentByAlias: Map<string, AutonomousDecisionReplayComponent<TValue>>,
+  components: Set<AutonomousDecisionReplayComponent<TValue>>
+): AutonomousDecisionReplayComponent<TValue> {
+  if (target === source) return target;
+  if (
+    source.firstOffset < target.firstOffset
+    || (source.firstOffset === target.firstOffset && source.queueSubject.localeCompare(target.queueSubject) < 0)
+  ) {
+    const swapped = target;
+    target = source;
+    source = swapped;
+  }
+
+  target.records += source.records;
+  target.applied += source.applied;
+  target.committed += source.committed;
+  target.rejected += source.rejected;
+  target.rerun += source.rerun;
+  target.humanBlocked += source.humanBlocked;
+  if (source.firstOffset < target.firstOffset) target.firstOffset = source.firstOffset;
+  if (source.lastOffset > target.lastOffset) target.lastOffset = source.lastOffset;
+  if (source.currentRecord.offset > target.currentRecord.offset) {
+    target.currentRecord = source.currentRecord;
+    target.status = source.status;
+  }
+  if (
+    source.terminalRecord !== null
+    && (target.terminalRecord === null || source.terminalRecord.offset > target.terminalRecord.offset)
+  ) {
+    target.terminalRecord = source.terminalRecord;
+    target.terminalStatus = source.terminalStatus;
+  }
+  for (const alias of source.aliases) {
+    target.aliases.add(alias);
+    componentByAlias.set(alias, target);
+  }
+  components.delete(source);
+  return target;
+}
+
+function materializeAutonomousDecisionReplaySubject<TValue extends JsonValue>(
+  component: AutonomousDecisionReplayComponent<TValue>
+): AutonomousDecisionReplaySubjectSummary<TValue> {
+  const queueSubjectAliases = Array.from(component.aliases).sort((left, right) => left.localeCompare(right));
+  return {
+    queueSubject: component.queueSubject,
+    queueSubjectAliases,
+    records: component.records,
+    firstOffset: component.firstOffset,
+    lastOffset: component.lastOffset,
+    applied: component.applied,
+    committed: component.committed,
+    rejected: component.rejected,
+    rerun: component.rerun,
+    humanBlocked: component.humanBlocked,
+    status: component.status,
+    terminalStatus: component.terminalStatus,
+    currentRecord: cloneRecord(component.currentRecord),
+    terminalRecord: component.terminalRecord === null ? null : cloneRecord(component.terminalRecord)
+  };
+}
+
 function readCursorOffset(cursor: EventLogCursor | number | null | undefined): number {
   if (cursor === null || cursor === undefined) return 0;
   if (typeof cursor === 'number') return Math.max(0, Math.floor(cursor));
@@ -1207,6 +1617,150 @@ function readEntrySeq(value: JsonValue): number {
     if (Number.isFinite(seq)) return seq;
   }
   return Number.POSITIVE_INFINITY;
+}
+
+const AUTONOMOUS_DECISION_REPLAY_STATUS_ORDER: AutonomousDecisionReplayStatus[] = [
+  'human-blocked',
+  'rerun',
+  'committed',
+  'applied',
+  'rejected'
+];
+
+const AUTONOMOUS_DECISION_REPLAY_STATUS_FIELDS = [
+  'type',
+  'kind',
+  'event',
+  'status',
+  'phase',
+  'state',
+  'outcome',
+  'decision',
+  'result'
+];
+
+const AUTONOMOUS_DECISION_REPLAY_STATUS_PATTERNS: Array<{
+  status: AutonomousDecisionReplayStatus;
+  normalized: readonly string[];
+  tokens?: readonly string[];
+}> = [
+  {
+    status: 'human-blocked',
+    normalized: ['humanblocked', 'blockedhuman'],
+    tokens: ['human', 'blocked']
+  },
+  {
+    status: 'rerun',
+    normalized: ['rerun', 'rerunwork', 'retry', 'requeue', 'stale', 'staleagainsthead', 'conflictblocked'],
+    tokens: ['rerun']
+  },
+  {
+    status: 'committed',
+    normalized: ['committed', 'commit'],
+    tokens: ['committed']
+  },
+  {
+    status: 'applied',
+    normalized: ['applied', 'apply', 'merged'],
+    tokens: ['applied']
+  },
+  {
+    status: 'rejected',
+    normalized: ['rejected', 'reject', 'denied'],
+    tokens: ['rejected']
+  }
+];
+
+const AUTONOMOUS_DECISION_REPLAY_SUBJECT_FIELDS = [
+  'queueSubject',
+  'queueSubjectAlias',
+  'subject',
+  'queueKey',
+  'jobId',
+  'taskId',
+  'key',
+  'alias',
+  'queueItemId',
+  'queueSubjectAliases',
+  'queueSubjects',
+  'queueKeys',
+  'queueItemIds',
+  'subjectAliases',
+  'aliases',
+  'subjects'
+] as const;
+
+function classifyAutonomousDecisionReplayRecord<TValue extends JsonValue>(
+  record: EventLogRecord<TValue>
+): AutonomousDecisionReplayClassifierResult {
+  const matches = new Set<AutonomousDecisionReplayStatus>();
+  collectAutonomousDecisionReplayValue(record.value, matches);
+  if (record.headers !== undefined) collectAutonomousDecisionReplayValue(record.headers, matches);
+  return orderAutonomousDecisionReplayStatuses(matches);
+}
+
+function resolveAutonomousDecisionReplaySubjects<TValue extends JsonValue>(
+  record: EventLogRecord<TValue>
+): AutonomousDecisionReplaySubjectResult {
+  const subjects = new Set<string>();
+  collectAutonomousDecisionReplaySubjects(record.value, subjects);
+  if (record.headers !== undefined) collectAutonomousDecisionReplaySubjects(record.headers, subjects);
+  if (record.key !== undefined) subjects.add(String(record.key).trim());
+  return Array.from(subjects).filter((subject) => subject.length > 0);
+}
+
+function collectAutonomousDecisionReplayValue(value: JsonValue, matches: Set<AutonomousDecisionReplayStatus>): void {
+  if (typeof value === 'string') {
+    collectAutonomousDecisionReplayText(value, matches);
+    return;
+  }
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return;
+  const object = value as JsonObject;
+  for (let i = 0; i < AUTONOMOUS_DECISION_REPLAY_STATUS_FIELDS.length; i++) {
+    const candidate = object[AUTONOMOUS_DECISION_REPLAY_STATUS_FIELDS[i]];
+    if (typeof candidate === 'string') collectAutonomousDecisionReplayText(candidate, matches);
+  }
+}
+
+function collectAutonomousDecisionReplaySubjects(value: JsonValue, subjects: Set<string>): void {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return;
+  const object = value as JsonObject;
+  for (let i = 0; i < AUTONOMOUS_DECISION_REPLAY_SUBJECT_FIELDS.length; i++) {
+    const field = AUTONOMOUS_DECISION_REPLAY_SUBJECT_FIELDS[i];
+    const candidate = object[field];
+    if (typeof candidate === 'string') {
+      subjects.add(String(candidate).trim());
+      continue;
+    }
+    if (Array.isArray(candidate)) {
+      for (let j = 0; j < candidate.length; j++) {
+        if (typeof candidate[j] === 'string') subjects.add(String(candidate[j]).trim());
+      }
+    }
+  }
+}
+
+function collectAutonomousDecisionReplayText(text: string, matches: Set<AutonomousDecisionReplayStatus>): void {
+  const normalized = text.toLowerCase().replace(/[^a-z0-9]+/g, '');
+  const tokens = text.toLowerCase().split(/[^a-z0-9]+/);
+  for (let i = 0; i < AUTONOMOUS_DECISION_REPLAY_STATUS_PATTERNS.length; i++) {
+    const pattern = AUTONOMOUS_DECISION_REPLAY_STATUS_PATTERNS[i];
+    if (pattern.normalized.some((candidate) => candidate === normalized)) {
+      matches.add(pattern.status);
+      continue;
+    }
+    if (pattern.tokens !== undefined && pattern.tokens.every((token) => tokens.includes(token))) {
+      matches.add(pattern.status);
+    }
+  }
+}
+
+function orderAutonomousDecisionReplayStatuses(matches: Set<AutonomousDecisionReplayStatus>): AutonomousDecisionReplayStatus | null {
+  for (let i = 0; i < AUTONOMOUS_DECISION_REPLAY_STATUS_ORDER.length; i++) {
+    const status = AUTONOMOUS_DECISION_REPLAY_STATUS_ORDER[i];
+    if (matches.has(status)) return status;
+  }
+  return null;
 }
 
 function estimateJsonBytes(value: JsonValue): number {

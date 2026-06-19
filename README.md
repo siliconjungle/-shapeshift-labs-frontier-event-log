@@ -239,6 +239,7 @@ console.log(replay.records, replay.cursor);
 import {
   applyPatchEventRecord,
   appendPatchEvent,
+  summarizeAutonomousDecisionReplay,
   createEventLogCheckpoint,
   createEventLog,
   createEventLogReplayStorage,
@@ -248,6 +249,7 @@ import {
   summarizeAgentReplay,
   type AgentReplaySummary,
   type AgentReplaySummaryClassifier,
+  type AutonomousDecisionReplaySummary,
   type EventLog,
   type EventLogCheckpoint,
   type EventLogConsumer,
@@ -315,6 +317,19 @@ console.log(summary.question, summary.decision, summary.applied);
 `summarizeAgentReplay()` reads a lifetime log in bounded batches and returns counts for agent/swarm lifecycle and merge-review events: `started`, `finished`, `failed`, `question`, `decision`, and `applied`. The default classifier scans common string fields such as `type`, `kind`, `event`, `status`, and `outcome`, so records like `agent.started`, `human.question`, `swarm.decision`, and `merge.applied` can feed a coordinator dashboard without importing swarm runtime packages.
 
 The summary also includes `records`, `matchedRecords`, `cursor`, `firstOffset`, `nextOffset`, `highWatermark`, and `truncated` so dashboards can show whether retained history was complete. Pass `strict: true` to fail on truncation, or pass `classify(record)` when a run uses a different event schema.
+
+### Autonomous Decision Replay
+
+```ts
+const replay = summarizeAutonomousDecisionReplay(log);
+
+console.log(replay.byQueueSubject['queue:alpha']?.terminalStatus);
+console.log(replay.latestOpenByQueueSubject['queue:beta']?.status);
+```
+
+`summarizeAutonomousDecisionReplay()` collapses decision records by queue subject aliases and keeps the latest collapsed state for each subject. The default resolver looks for common subject fields such as `queueSubject`, `queueSubjectAlias`, `queueSubjectAliases`, `queueSubjects`, `queueKeys`, `queueItemIds`, `jobId`, `taskId`, `key`, and `alias`, then merges any overlapping aliases into one subject summary.
+
+Terminal `applied`, `committed`, and `rejected` records remain in `latestTerminalByQueueSubject`, while `rerun` and `human-blocked` records stay visible in `latestOpenByQueueSubject` until a terminal record supersedes them. The returned summary also exposes `byAlias` for direct alias lookup.
 
 ### Temporal State And Diff
 
