@@ -506,9 +506,10 @@ export function summarizeQuestionLifecycleReplay<TValue extends JsonValue = Json
     for (let j = 0; j < question.questionIds.length; j++) {
       summary.byAlias[question.questionIds[j]] = question;
     }
-    if (question.status === 'answered') {
+    if (question.answered > 0) {
       summary.latestAnsweredByQuestionId[question.questionId] = question;
-    } else if (question.status === 'consumed') {
+    }
+    if (question.consumed > 0) {
       summary.latestConsumedByQuestionId[question.questionId] = question;
     }
   }

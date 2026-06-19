@@ -304,6 +304,7 @@ assert.strictEqual(replaySemanticChangeStreamEventsSubpath, replaySemanticChange
   assert.strictEqual(summary.byQuestionId['question:route-me'].status, 'consumed');
   assert.strictEqual(summary.byQuestionId['question:route-me'].terminalStatus, 'consumed');
   assert.strictEqual(summary.byQuestionId['question:route-me'].terminalRecord.value.continuationTarget, 'continue:parent');
+  assert.strictEqual(summary.latestAnsweredByQuestionId['question:route-me'], summary.byQuestionId['question:route-me']);
   assert.strictEqual(summary.answeredQuestions.length, 1);
   assert.strictEqual(summary.answeredQuestions[0].questionId, 'question:pending');
   assert.strictEqual(summary.latestAnsweredByQuestionId['question:pending'], summary.byQuestionId['question:pending']);

@@ -420,7 +420,7 @@ console.log(questionSummary.byQuestionId['question:alpha']?.status);
 console.log(questionSummary.answeredQuestions.length);
 ```
 
-`appendQuestionAskedEvent()` is a convenience alias for `appendQuestionOpenedEvent()`, and the append helpers write `question.opened`, `question.answered`, and `question.consumed` records with stable `questionId`/`eventId` defaults when you omit them. `summarizeQuestionLifecycleReplay()` groups those events by question identity, preserves aliases such as `questionCode`, `taskId`, and `jobId`, and separates `openedQuestions`, `answeredQuestions`, and `consumedQuestions` so dashboards and continuation routing can render the current lifecycle without a second projection layer.
+`appendQuestionAskedEvent()` is a convenience alias for `appendQuestionOpenedEvent()`, and the append helpers write `question.opened`, `question.answered`, and `question.consumed` records with stable `questionId`/`eventId` defaults when you omit them. `summarizeQuestionLifecycleReplay()` groups those events by question identity, preserves aliases such as `questionCode`, `taskId`, and `jobId`, and separates `openedQuestions`, `answeredQuestions`, and `consumedQuestions` so dashboards and continuation routing can render the current lifecycle without a second projection layer. Questions remain available in `latestAnsweredByQuestionId` and `latestConsumedByQuestionId` once they have reached those stages, even after later routing updates.
 
 ### Autonomous Decision Replay
 
