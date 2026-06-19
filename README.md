@@ -245,6 +245,9 @@ import {
   diffBetweenTimes,
   replayEventLog,
   stateAtTime,
+  summarizeAgentReplay,
+  type AgentReplaySummary,
+  type AgentReplaySummaryClassifier,
   type EventLog,
   type EventLogCheckpoint,
   type EventLogConsumer,
@@ -300,6 +303,19 @@ const result = replayEventLog(log, checkpoint, (state, record) => ({
 
 `createEventLogCheckpoint()` captures an application snapshot plus an event-log cursor. `replayEventLog()` resumes from that cursor in bounded batches and returns the replayed state, cursor, replay count, and a fresh checkpoint. `createEventLogReplayStorage()` provides the same snapshot-plus-bounded-change-log shape used by state-cache persistence without making state-cache depend on event-log.
 
+### Agent/Swarm Replay Summary
+
+```ts
+const summary = summarizeAgentReplay(log, { batchSize: 512 });
+
+console.log(summary.started, summary.finished, summary.failed);
+console.log(summary.question, summary.decision, summary.applied);
+```
+
+`summarizeAgentReplay()` reads a lifetime log in bounded batches and returns counts for agent/swarm lifecycle and merge-review events: `started`, `finished`, `failed`, `question`, `decision`, and `applied`. The default classifier scans common string fields such as `type`, `kind`, `event`, `status`, and `outcome`, so records like `agent.started`, `human.question`, `swarm.decision`, and `merge.applied` can feed a coordinator dashboard without importing swarm runtime packages.
+
+The summary also includes `records`, `matchedRecords`, `cursor`, `firstOffset`, `nextOffset`, `highWatermark`, and `truncated` so dashboards can show whether retained history was complete. Pass `strict: true` to fail on truncation, or pass `classify(record)` when a run uses a different event schema.
+
 ### Temporal State And Diff
 
 `stateAtTime()` materializes state at an offset, cursor, high-watermark, or timestamp by replaying from a checkpoint. `diffBetweenTimes()` materializes two temporal states and returns a Frontier patch between them. For patch-event logs, `applyPatchEventRecord()` is the reducer.
@@ -341,6 +357,7 @@ This package owns:
 
 - in-memory event logs,
 - snapshot checkpoints and bounded replay helpers,
+- agent/swarm replay summaries for coordinator dashboards,
 - temporal state-at-time and diff-between-times helpers,
 - generic replay storage for snapshot plus change-log adapters,
 - append batching and bounded replay windows,
@@ -371,7 +388,7 @@ npm run bench
 npm run pack:dry
 ```
 
-The package test suite covers root and subpath imports, append/read behavior, clone isolation, retention policies, keyed compaction, batch limits, consumers, checkpoint replay, temporal state/diff, replay storage, patch events, and randomized operation sequences.
+The package test suite covers root and subpath imports, append/read behavior, clone isolation, retention policies, keyed compaction, batch limits, consumers, checkpoint replay, agent/swarm replay summaries, temporal state/diff, replay storage, patch events, and randomized operation sequences.
 
 ## Benchmarks
 

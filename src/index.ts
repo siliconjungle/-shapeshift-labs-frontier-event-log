@@ -6,10 +6,16 @@ export {
   createEventLogReplayStorage,
   diffBetweenTimes,
   stateAtTime,
-  replayEventLog
+  replayEventLog,
+  summarizeAgentReplay
 } from './event-log.ts';
 
 export type {
+  AgentReplaySummary,
+  AgentReplaySummaryClassifier,
+  AgentReplaySummaryClassifierResult,
+  AgentReplaySummaryKind,
+  AgentReplaySummaryOptions,
   EventLog,
   EventLogAppendInput,
   EventLogAppendRejectReason,

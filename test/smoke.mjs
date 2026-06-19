@@ -8,7 +8,8 @@ import {
   createEventLogReplayStorage,
   diffBetweenTimes,
   stateAtTime,
-  replayEventLog
+  replayEventLog,
+  summarizeAgentReplay
 } from '../dist/index.js';
 import { createEventLog as createEventLogSubpath } from '../dist/event-log.js';
 
@@ -148,6 +149,47 @@ assert.strictEqual(createEventLogSubpath, createEventLog);
   assert.strictEqual(log.truncateBefore(checkpoint.cursor), 2);
   assert.strictEqual(log.read(0).truncated, true);
   assert.deepStrictEqual(log.read(0).records.map((record) => record.value.delta), [4, 5]);
+}
+
+{
+  const log = createEventLog();
+  log.append({ value: { type: 'agent.started', id: 'agent-a' } });
+  log.append({ value: { kind: 'human.question', id: 'q1' } });
+  log.append({ value: { type: 'swarm.decision', id: 'd1' } });
+  log.append({ value: { event: 'merge.applied', id: 'bundle-a' } });
+  log.append({ value: { status: 'finished', id: 'agent-a' } });
+  log.append({ value: { type: 'agent.failed', id: 'agent-b' } });
+  log.append({ value: { type: 'trace.sample', id: 'ignored' } });
+
+  const summary = summarizeAgentReplay(log, { batchSize: 2 });
+  assert.deepStrictEqual({
+    started: summary.started,
+    finished: summary.finished,
+    failed: summary.failed,
+    question: summary.question,
+    decision: summary.decision,
+    applied: summary.applied
+  }, {
+    started: 1,
+    finished: 1,
+    failed: 1,
+    question: 1,
+    decision: 1,
+    applied: 1
+  });
+  assert.strictEqual(summary.records, 7);
+  assert.strictEqual(summary.matchedRecords, 6);
+  assert.deepStrictEqual(summary.cursor, { offset: 7 });
+  assert.strictEqual(summary.truncated, false);
+
+  const custom = summarizeAgentReplay(log, {
+    classify(record) {
+      return record.value.id === 'bundle-a' ? ['decision', 'applied'] : null;
+    }
+  });
+  assert.strictEqual(custom.decision, 1);
+  assert.strictEqual(custom.applied, 1);
+  assert.strictEqual(custom.matchedRecords, 1);
 }
 
 {
