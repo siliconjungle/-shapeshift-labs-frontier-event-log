@@ -1136,6 +1136,129 @@ export function appendPatchEvent(
   });
 }
 
+export type ModelRoutingFeedbackEventKind =
+  | 'model.chosen'
+  | 'model.outcome'
+  | 'tournament.observation'
+  | 'rsi.recommendation';
+
+export interface ModelRoutingFeedbackEventValue extends JsonObject {
+  kind: ModelRoutingFeedbackEventKind;
+  taskKind?: string;
+  model?: string;
+}
+
+export type ModelRoutingFeedbackEventFields = Omit<ModelRoutingFeedbackEventValue, 'kind'>;
+
+export interface ModelRoutingFeedbackEventFilterOptions {
+  kind?: ModelRoutingFeedbackEventKind | readonly ModelRoutingFeedbackEventKind[];
+  taskKind?: string | readonly string[];
+  model?: string | readonly string[];
+}
+
+export function appendModelChosenEvent(
+  log: EventLog<ModelRoutingFeedbackEventValue>,
+  value: ModelRoutingFeedbackEventFields,
+  options: Omit<EventLogAppendInput<ModelRoutingFeedbackEventValue>, 'value'> = {}
+): EventLogRecord<ModelRoutingFeedbackEventValue> {
+  return appendModelRoutingFeedbackEvent(log, 'model.chosen', value, options);
+}
+
+export function appendModelOutcomeEvent(
+  log: EventLog<ModelRoutingFeedbackEventValue>,
+  value: ModelRoutingFeedbackEventFields,
+  options: Omit<EventLogAppendInput<ModelRoutingFeedbackEventValue>, 'value'> = {}
+): EventLogRecord<ModelRoutingFeedbackEventValue> {
+  return appendModelRoutingFeedbackEvent(log, 'model.outcome', value, options);
+}
+
+export function appendTournamentObservationEvent(
+  log: EventLog<ModelRoutingFeedbackEventValue>,
+  value: ModelRoutingFeedbackEventFields,
+  options: Omit<EventLogAppendInput<ModelRoutingFeedbackEventValue>, 'value'> = {}
+): EventLogRecord<ModelRoutingFeedbackEventValue> {
+  return appendModelRoutingFeedbackEvent(log, 'tournament.observation', value, options);
+}
+
+export function appendRsiRecommendationEvent(
+  log: EventLog<ModelRoutingFeedbackEventValue>,
+  value: ModelRoutingFeedbackEventFields,
+  options: Omit<EventLogAppendInput<ModelRoutingFeedbackEventValue>, 'value'> = {}
+): EventLogRecord<ModelRoutingFeedbackEventValue> {
+  return appendModelRoutingFeedbackEvent(log, 'rsi.recommendation', value, options);
+}
+
+export function filterModelRoutingFeedbackEvents<TValue extends ModelRoutingFeedbackEventValue>(
+  records: readonly EventLogRecord<TValue>[],
+  options: ModelRoutingFeedbackEventFilterOptions = {}
+): EventLogRecord<TValue>[] {
+  const kindFilter = normalizeModelRoutingFeedbackFilter(options.kind);
+  const taskKindFilter = normalizeModelRoutingFeedbackFilter(options.taskKind);
+  const modelFilter = normalizeModelRoutingFeedbackFilter(options.model);
+  const filtered: EventLogRecord<TValue>[] = [];
+  for (let i = 0; i < records.length; i++) {
+    const record = records[i];
+    if (matchesModelRoutingFeedbackEvent(record.value, kindFilter, taskKindFilter, modelFilter)) {
+      filtered.push(record);
+    }
+  }
+  return filtered;
+}
+
+function appendModelRoutingFeedbackEvent(
+  log: EventLog<ModelRoutingFeedbackEventValue>,
+  kind: ModelRoutingFeedbackEventKind,
+  value: ModelRoutingFeedbackEventFields,
+  options: Omit<EventLogAppendInput<ModelRoutingFeedbackEventValue>, 'value'> = {}
+): EventLogRecord<ModelRoutingFeedbackEventValue> {
+  const payload = cloneJson(value) as JsonValue;
+  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new TypeError('event log model routing feedback event value must be an object');
+  }
+  (payload as ModelRoutingFeedbackEventValue).kind = kind;
+  return log.append({
+    key: options.key,
+    timestamp: options.timestamp,
+    headers: options.headers,
+    value: payload as ModelRoutingFeedbackEventValue
+  });
+}
+
+function normalizeModelRoutingFeedbackFilter(
+  value?: string | readonly string[] | ModelRoutingFeedbackEventKind | readonly ModelRoutingFeedbackEventKind[]
+): readonly string[] | null {
+  if (value === undefined) return null;
+  const values = Array.isArray(value) ? value : [value];
+  const out: string[] = [];
+  for (let i = 0; i < values.length; i++) {
+    const candidate = String(values[i]).trim();
+    if (candidate.length === 0 || out.includes(candidate)) continue;
+    out.push(candidate);
+  }
+  return out;
+}
+
+function matchesModelRoutingFeedbackEvent(
+  value: JsonValue,
+  kindFilter: readonly string[] | null,
+  taskKindFilter: readonly string[] | null,
+  modelFilter: readonly string[] | null
+): boolean {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const event = value as ModelRoutingFeedbackEventValue;
+  if (kindFilter !== null && !kindFilter.includes(event.kind)) return false;
+  if (taskKindFilter !== null && !matchesModelRoutingFeedbackField(event.taskKind, taskKindFilter)) return false;
+  if (modelFilter !== null && !matchesModelRoutingFeedbackField(event.model, modelFilter)) return false;
+  return true;
+}
+
+function matchesModelRoutingFeedbackField(value: string | undefined, filter: readonly string[]): boolean {
+  if (value === undefined) return false;
+  const normalized = String(value).trim();
+  if (normalized.length === 0) return false;
+  return filter.includes(normalized);
+}
+
 class EventLogConsumerImpl<T extends JsonValue> implements EventLogConsumer<T> {
   private position: number;
   private committedOffset: number;

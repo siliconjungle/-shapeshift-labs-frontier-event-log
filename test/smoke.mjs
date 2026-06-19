@@ -3,10 +3,15 @@ import { applyPatch, diff } from '@shapeshift-labs/frontier';
 import {
   applyPatchEventRecord,
   appendPatchEvent,
+  appendModelChosenEvent,
+  appendModelOutcomeEvent,
+  appendRsiRecommendationEvent,
+  appendTournamentObservationEvent,
   createEventLog,
   createEventLogCheckpoint,
   createEventLogReplayStorage,
   diffBetweenTimes,
+  filterModelRoutingFeedbackEvents,
   stateAtTime,
   replayEventLog,
   summarizeAgentReplay,
@@ -240,6 +245,62 @@ assert.strictEqual(createEventLogSubpath, createEventLog);
   assert.strictEqual(summary.latestTerminalByQueueSubject['queue:alpha'], summary.byQueueSubject['queue:alpha']);
   assert.strictEqual(summary.latestOpenByQueueSubject['queue:beta'].status, 'human-blocked');
   assert.strictEqual(summary.latestOpenByQueueSubject['queue:beta'].terminalStatus, null);
+}
+
+{
+  const log = createEventLog();
+  const chosen = appendModelChosenEvent(log, {
+    taskKind: 'routing-feedback',
+    model: 'gpt-5.4-mini',
+    reason: 'best latency/cost fit'
+  });
+  appendModelOutcomeEvent(log, {
+    taskKind: 'routing-feedback',
+    model: 'gpt-5.4-mini',
+    outcome: 'accepted'
+  });
+  appendTournamentObservationEvent(log, {
+    taskKind: 'routing-feedback',
+    model: 'gpt-5.4-mini',
+    observation: 'won head-to-head against gpt-4.1'
+  });
+  appendRsiRecommendationEvent(log, {
+    taskKind: 'routing-feedback',
+    model: 'gpt-4.1',
+    recommendation: 'reroute future retries to gpt-5.4-mini'
+  });
+
+  chosen.value.reason = 'mutated after append';
+  const records = log.read(0).records;
+  assert.deepStrictEqual(records.map((record) => record.value.kind), [
+    'model.chosen',
+    'model.outcome',
+    'tournament.observation',
+    'rsi.recommendation'
+  ]);
+  assert.strictEqual(records[0].value.reason, 'best latency/cost fit');
+  assert.deepStrictEqual(
+    filterModelRoutingFeedbackEvents(records, {
+      taskKind: 'routing-feedback',
+      model: 'gpt-5.4-mini'
+    }).map((record) => record.value.kind),
+    ['model.chosen', 'model.outcome', 'tournament.observation']
+  );
+
+  const replayed = replayEventLog(
+    log,
+    createEventLogCheckpoint(log, [], { cursor: 0 }),
+    (state, record) => {
+      state.push(record.value.kind);
+      return state;
+    }
+  );
+  assert.deepStrictEqual(replayed.state, [
+    'model.chosen',
+    'model.outcome',
+    'tournament.observation',
+    'rsi.recommendation'
+  ]);
 }
 
 {

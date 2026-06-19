@@ -239,11 +239,16 @@ console.log(replay.records, replay.cursor);
 import {
   applyPatchEventRecord,
   appendPatchEvent,
+  appendModelChosenEvent,
+  appendModelOutcomeEvent,
+  appendRsiRecommendationEvent,
+  appendTournamentObservationEvent,
   summarizeAutonomousDecisionReplay,
   createEventLogCheckpoint,
   createEventLog,
   createEventLogReplayStorage,
   diffBetweenTimes,
+  filterModelRoutingFeedbackEvents,
   replayEventLog,
   stateAtTime,
   summarizeAgentReplay,
@@ -331,6 +336,43 @@ console.log(replay.latestOpenByQueueSubject['queue:beta']?.status);
 
 Terminal `applied`, `committed`, and `rejected` records remain in `latestTerminalByQueueSubject`, while `rerun` and `human-blocked` records stay visible in `latestOpenByQueueSubject` until a terminal record supersedes them. The returned summary also exposes `byAlias` for direct alias lookup.
 
+### Model Routing Feedback Events
+
+```ts
+const log = createEventLog();
+
+appendModelChosenEvent(log, {
+  taskKind: 'routing-feedback',
+  model: 'gpt-5.4-mini',
+  reason: 'best latency/cost fit'
+});
+
+appendModelOutcomeEvent(log, {
+  taskKind: 'routing-feedback',
+  model: 'gpt-5.4-mini',
+  outcome: 'accepted'
+});
+
+appendTournamentObservationEvent(log, {
+  taskKind: 'routing-feedback',
+  model: 'gpt-5.4-mini',
+  observation: 'won head-to-head against gpt-4.1'
+});
+
+appendRsiRecommendationEvent(log, {
+  taskKind: 'routing-feedback',
+  model: 'gpt-4.1',
+  recommendation: 'reroute future retries to gpt-5.4-mini'
+});
+
+const records = filterModelRoutingFeedbackEvents(log.read(0).records, {
+  taskKind: 'routing-feedback',
+  model: 'gpt-5.4-mini'
+});
+```
+
+The structural feedback helpers append ordinary event-log records with `kind`, `taskKind`, and `model` fields so routing telemetry can be replayed or filtered without importing a higher-level worker package. Use `filterModelRoutingFeedbackEvents()` to keep only records for a given task kind, model, or event kind before replaying them into a dashboard or report.
+
 ### Temporal State And Diff
 
 `stateAtTime()` materializes state at an offset, cursor, high-watermark, or timestamp by replaying from a checkpoint. `diffBetweenTimes()` materializes two temporal states and returns a Frontier patch between them. For patch-event logs, `applyPatchEventRecord()` is the reducer.
@@ -379,6 +421,7 @@ This package owns:
 - consumer cursors and acknowledgements,
 - capacity retention policies,
 - keyed compaction and tombstone dropping,
+- model routing feedback event helpers,
 - Frontier patch event records.
 
 It does not own:
