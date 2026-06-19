@@ -29,7 +29,7 @@ const patch = diff(
 const replayLog = seededLog(4096);
 const consumerLog = seededLog(512);
 const consumer = consumerLog.createConsumer('bench');
-const temporalFixture = createTemporalFixture();
+const temporalPatchFixture = seededPatchLog(128);
 const compactBatchInputs = Array.from({ length: 1024 }, (_, i) => ({
   key: 'entity:' + (i & 127),
   value: { revision: i }
@@ -70,21 +70,21 @@ const rows = [
   }),
   runRow('State at offset, 64 patch events', 1000, () => {
     const result = stateAtTime(
-      temporalFixture.log,
-      temporalFixture.checkpoint,
+      temporalPatchFixture.log,
+      temporalPatchFixture.checkpoint,
       applyPatchEventRecord,
-      { at: 64 }
+      { at: 64, batchSize: 32 }
     );
-    sink += result.cursor.offset;
+    sink += result.state.rows[0].score;
   }),
-  runRow('Diff between offsets, 64 patch events', 1000, () => {
+  runRow('Diff between offsets, 64 patch events', 500, () => {
     const result = diffBetweenTimes(
-      temporalFixture.log,
-      temporalFixture.checkpoint,
+      temporalPatchFixture.log,
+      temporalPatchFixture.checkpoint,
       applyPatchEventRecord,
-      { from: 16, to: 64 }
+      { from: 32, to: 96, batchSize: 32 }
     );
-    sink += result.patch.length;
+    sink += result.patch.length + result.after.rows[0].score;
   }),
   runRow('Replay storage append/read checkpoint', 1000, () => {
     const storage = createEventLogReplayStorage({ initialSnapshot: { count: 0 }, now: () => 1 });
@@ -106,17 +106,14 @@ function seededLog(count) {
   return log;
 }
 
-function createTemporalFixture() {
-  const log = createEventLog({ now: () => 1 });
-  const checkpoint = createEventLogCheckpoint(log, { rows: [{ id: 'a', score: 0 }], meta: { tick: 0 } }, { timestamp: 1 });
-  let current = checkpoint.snapshot;
-  for (let i = 1; i <= 64; i++) {
-    const next = {
-      rows: [{ id: 'a', score: i }, { id: 'b', score: i & 7 }],
-      meta: { tick: i }
-    };
-    appendPatchEvent(log, diff(current, next, { arrayKey: 'id' }), { timestamp: i + 1 });
-    current = next;
+function seededPatchLog(count) {
+  const log = createEventLog({ capacity: count + 1, now: () => 1 });
+  let state = { rows: [{ id: 'a', score: 0 }], meta: { tick: 0 } };
+  const checkpoint = createEventLogCheckpoint(log, state, { timestamp: 0 });
+  for (let i = 0; i < count; i++) {
+    const next = { rows: [{ id: 'a', score: i + 1 }], meta: { tick: i + 1 } };
+    appendPatchEvent(log, diff(state, next, { arrayKey: 'id' }), { key: 'doc:1', timestamp: i + 1 });
+    state = next;
   }
   return { log, checkpoint };
 }

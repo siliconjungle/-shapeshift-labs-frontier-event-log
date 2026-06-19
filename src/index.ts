@@ -1,15 +1,35 @@
 export {
   applyPatchEventRecord,
   appendPatchEvent,
+  appendModelChosenEvent,
+  appendModelOutcomeEvent,
+  appendRsiRecommendationEvent,
+  appendTournamentObservationEvent,
   createEventLog,
   createEventLogCheckpoint,
   createEventLogReplayStorage,
   diffBetweenTimes,
+  filterModelRoutingFeedbackEvents,
+  summarizeAutonomousDecisionReplay,
   stateAtTime,
-  replayEventLog
-} from './event-log.js';
+  replayEventLog,
+  summarizeAgentReplay
+} from './event-log.ts';
 
 export type {
+  AgentReplaySummary,
+  AgentReplaySummaryClassifier,
+  AgentReplaySummaryClassifierResult,
+  AgentReplaySummaryKind,
+  AgentReplaySummaryOptions,
+  AutonomousDecisionReplayClassifier,
+  AutonomousDecisionReplayClassifierResult,
+  AutonomousDecisionReplayOptions,
+  AutonomousDecisionReplayStatus,
+  AutonomousDecisionReplaySubjectResult,
+  AutonomousDecisionReplaySubjectSummary,
+  AutonomousDecisionReplaySummary,
+  AutonomousDecisionReplayTerminalStatus,
   EventLog,
   EventLogAppendInput,
   EventLogAppendRejectReason,
@@ -39,8 +59,12 @@ export type {
   EventLogDiffBetweenTimesOptions,
   PatchEventLogOptions,
   PatchEventLogValue,
+  ModelRoutingFeedbackEventFields,
+  ModelRoutingFeedbackEventFilterOptions,
+  ModelRoutingFeedbackEventKind,
+  ModelRoutingFeedbackEventValue,
   EventLogStateAtTimeOptions,
   EventLogTemporalDiffResult,
   EventLogTemporalPoint,
   EventLogTemporalStateResult
-} from './event-log.js';
+} from './event-log.ts';

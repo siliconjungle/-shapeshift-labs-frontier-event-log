@@ -3,12 +3,19 @@ import { applyPatch, diff } from '@shapeshift-labs/frontier';
 import {
   applyPatchEventRecord,
   appendPatchEvent,
+  appendModelChosenEvent,
+  appendModelOutcomeEvent,
+  appendRsiRecommendationEvent,
+  appendTournamentObservationEvent,
   createEventLog,
   createEventLogCheckpoint,
   createEventLogReplayStorage,
   diffBetweenTimes,
+  filterModelRoutingFeedbackEvents,
   stateAtTime,
-  replayEventLog
+  replayEventLog,
+  summarizeAgentReplay,
+  summarizeAutonomousDecisionReplay
 } from '../dist/index.js';
 import { createEventLog as createEventLogSubpath } from '../dist/event-log.js';
 
@@ -148,6 +155,152 @@ assert.strictEqual(createEventLogSubpath, createEventLog);
   assert.strictEqual(log.truncateBefore(checkpoint.cursor), 2);
   assert.strictEqual(log.read(0).truncated, true);
   assert.deepStrictEqual(log.read(0).records.map((record) => record.value.delta), [4, 5]);
+}
+
+{
+  const log = createEventLog();
+  log.append({ value: { type: 'agent.started', id: 'agent-a' } });
+  log.append({ value: { kind: 'human.question', id: 'q1' } });
+  log.append({ value: { type: 'swarm.decision', id: 'd1' } });
+  log.append({ value: { event: 'merge.applied', id: 'bundle-a' } });
+  log.append({ value: { status: 'finished', id: 'agent-a' } });
+  log.append({ value: { type: 'agent.failed', id: 'agent-b' } });
+  log.append({ value: { type: 'trace.sample', id: 'ignored' } });
+
+  const summary = summarizeAgentReplay(log, { batchSize: 2 });
+  assert.deepStrictEqual({
+    started: summary.started,
+    finished: summary.finished,
+    failed: summary.failed,
+    question: summary.question,
+    decision: summary.decision,
+    applied: summary.applied
+  }, {
+    started: 1,
+    finished: 1,
+    failed: 1,
+    question: 1,
+    decision: 1,
+    applied: 1
+  });
+  assert.strictEqual(summary.records, 7);
+  assert.strictEqual(summary.matchedRecords, 6);
+  assert.deepStrictEqual(summary.cursor, { offset: 7 });
+  assert.strictEqual(summary.truncated, false);
+
+  const custom = summarizeAgentReplay(log, {
+    classify(record) {
+      return record.value.id === 'bundle-a' ? ['decision', 'applied'] : null;
+    }
+  });
+  assert.strictEqual(custom.decision, 1);
+  assert.strictEqual(custom.applied, 1);
+  assert.strictEqual(custom.matchedRecords, 1);
+}
+
+{
+  const log = createEventLog();
+  log.append({
+    value: {
+      type: 'autonomous-decision',
+      status: 'rerun',
+      queueSubject: 'queue:alpha',
+      queueSubjectAliases: ['job:alpha', 'task:alpha'],
+      reason: 'rerun against head'
+    }
+  });
+  log.append({
+    value: {
+      kind: 'autonomous-decision',
+      event: 'committed',
+      jobId: 'job:alpha',
+      queueKeys: ['queue:alpha', 'task:alpha'],
+      reason: 'applied after rerun'
+    }
+  });
+  log.append({
+    value: {
+      type: 'autonomous-decision',
+      status: 'human-blocked',
+      queueSubject: 'queue:beta',
+      queueSubjectAliases: ['job:beta'],
+      reason: 'needs human answer'
+    }
+  });
+
+  const summary = summarizeAutonomousDecisionReplay(log);
+  assert.strictEqual(summary.records, 3);
+  assert.strictEqual(summary.matchedRecords, 3);
+  assert.strictEqual(summary.rerun, 1);
+  assert.strictEqual(summary.committed, 1);
+  assert.strictEqual(summary.humanBlocked, 1);
+  assert.strictEqual(summary.terminalRecords, 1);
+  assert.strictEqual(summary.openRecords, 2);
+  assert.strictEqual(summary.subjects.length, 2);
+  assert.strictEqual(summary.byAlias['job:alpha'], summary.byQueueSubject['queue:alpha']);
+  assert.strictEqual(summary.byAlias['task:alpha'], summary.byQueueSubject['queue:alpha']);
+  assert.deepStrictEqual(summary.byQueueSubject['queue:alpha'].queueSubjectAliases, ['job:alpha', 'queue:alpha', 'task:alpha']);
+  assert.strictEqual(summary.byQueueSubject['queue:alpha'].status, 'committed');
+  assert.strictEqual(summary.byQueueSubject['queue:alpha'].terminalStatus, 'committed');
+  assert.strictEqual(summary.latestTerminalByQueueSubject['queue:alpha'], summary.byQueueSubject['queue:alpha']);
+  assert.strictEqual(summary.latestOpenByQueueSubject['queue:beta'].status, 'human-blocked');
+  assert.strictEqual(summary.latestOpenByQueueSubject['queue:beta'].terminalStatus, null);
+}
+
+{
+  const log = createEventLog();
+  const chosen = appendModelChosenEvent(log, {
+    taskKind: 'routing-feedback',
+    model: 'gpt-5.4-mini',
+    reason: 'best latency/cost fit'
+  });
+  appendModelOutcomeEvent(log, {
+    taskKind: 'routing-feedback',
+    model: 'gpt-5.4-mini',
+    outcome: 'accepted'
+  });
+  appendTournamentObservationEvent(log, {
+    taskKind: 'routing-feedback',
+    model: 'gpt-5.4-mini',
+    observation: 'won head-to-head against gpt-4.1'
+  });
+  appendRsiRecommendationEvent(log, {
+    taskKind: 'routing-feedback',
+    model: 'gpt-4.1',
+    recommendation: 'reroute future retries to gpt-5.4-mini'
+  });
+
+  chosen.value.reason = 'mutated after append';
+  const records = log.read(0).records;
+  assert.deepStrictEqual(records.map((record) => record.value.kind), [
+    'model.chosen',
+    'model.outcome',
+    'tournament.observation',
+    'rsi.recommendation'
+  ]);
+  assert.strictEqual(records[0].value.reason, 'best latency/cost fit');
+  assert.deepStrictEqual(
+    filterModelRoutingFeedbackEvents(records, {
+      taskKind: 'routing-feedback',
+      model: 'gpt-5.4-mini'
+    }).map((record) => record.value.kind),
+    ['model.chosen', 'model.outcome', 'tournament.observation']
+  );
+
+  const replayed = replayEventLog(
+    log,
+    createEventLogCheckpoint(log, [], { cursor: 0 }),
+    (state, record) => {
+      state.push(record.value.kind);
+      return state;
+    }
+  );
+  assert.deepStrictEqual(replayed.state, [
+    'model.chosen',
+    'model.outcome',
+    'tournament.observation',
+    'rsi.recommendation'
+  ]);
 }
 
 {

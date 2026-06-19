@@ -2,7 +2,8 @@ import assert from 'node:assert';
 import {
   createEventLog,
   createEventLogCheckpoint,
-  replayEventLog
+  replayEventLog,
+  stateAtTime
 } from '../dist/index.js';
 
 const args = parseArgs(process.argv.slice(2));
@@ -80,6 +81,17 @@ function runCase(caseId, rng) {
     const replayed = replayEventLog(log, checkpoint, (state) => ({ count: state.count + 1 }), { strict: false });
     assert.strictEqual(replayed.state.count, replay.records.length);
     assert.strictEqual(replayed.replayed, replay.records.length - split);
+
+    const targetIndex = split + randomInt(rng, replay.records.length - split + 1);
+    const targetCursor = targetIndex === 0
+      ? replay.firstOffset
+      : replay.records[targetIndex - 1].offset + 1;
+    const temporal = stateAtTime(log, checkpoint, (state) => ({ count: state.count + 1 }), {
+      at: targetCursor,
+      strict: false
+    });
+    assert.strictEqual(temporal.state.count, targetIndex);
+    assert.strictEqual(temporal.replayed, targetIndex - split);
   }
 }
 
